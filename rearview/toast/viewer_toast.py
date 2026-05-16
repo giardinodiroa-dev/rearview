@@ -185,6 +185,28 @@ class _ResizeHandle(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# _ClickableImageLabel
+# ---------------------------------------------------------------------------
+
+class _ClickableImageLabel(QLabel):
+    """QLabel that emits the relative click position (0-1) within the label."""
+    clicked_at = pyqtSignal(float, float)  # rel_x, rel_y
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            w, h = self.width(), self.height()
+            if w > 0 and h > 0:
+                rel_x = max(0.0, min(1.0, event.pos().x() / w))
+                rel_y = max(0.0, min(1.0, event.pos().y() / h))
+                self.clicked_at.emit(rel_x, rel_y)
+        super().mousePressEvent(event)
+
+
+# ---------------------------------------------------------------------------
 # _RegionWidget
 # ---------------------------------------------------------------------------
 
@@ -194,7 +216,8 @@ class _RegionWidget(QFrame):
     rename_requested  = pyqtSignal(str)
     delete_requested  = pyqtSignal(str)
     remap_requested   = pyqtSignal(str)
-    reorder_requested = pyqtSignal(str, str)  # source_name, target_name
+    reorder_requested = pyqtSignal(str, str)   # source_name, target_name
+    click_requested   = pyqtSignal(str, float, float)  # name, rel_x, rel_y
 
     def __init__(self, name: str, pixmap: QPixmap, parent=None):
         super().__init__(parent)
@@ -287,7 +310,10 @@ class _RegionWidget(QFrame):
         img_layout.setContentsMargins(8, 8, 8, 8)
         img_layout.setSpacing(0)
 
-        self._img_label = QLabel()
+        self._img_label = _ClickableImageLabel()
+        self._img_label.clicked_at.connect(
+            lambda rx, ry: self.click_requested.emit(self._name, rx, ry)
+        )
         self._img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._img_label.setStyleSheet("background: transparent; border: none;")
         # Ignored horizontal policy: label never pushes content wider than viewport
@@ -437,6 +463,7 @@ class ViewerToast(QWidget):
     region_deleted          = pyqtSignal(str)        # name
     region_remap_requested  = pyqtSignal(str)        # name
     region_reordered        = pyqtSignal(str, str)   # source_name, target_name
+    region_click_requested  = pyqtSignal(str, float, float)  # name, rel_x, rel_y
 
     # Internal signals for thread-safe calls from background threads
     _sig_update = pyqtSignal(object)   # list[tuple[str, QPixmap]]
@@ -476,6 +503,7 @@ class ViewerToast(QWidget):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.X11BypassWindowManagerHint
         )
         self.setMinimumSize(0, 0)
         self.resize(380, 560)
@@ -954,6 +982,7 @@ class ViewerToast(QWidget):
             rw.delete_requested.connect(self._on_delete_region)
             rw.remap_requested.connect(self._on_remap_region)
             rw.reorder_requested.connect(self._on_reorder)
+            rw.click_requested.connect(self.region_click_requested)
 
         count = len(region_tiles)
         self._count_label.setText(

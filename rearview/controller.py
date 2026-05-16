@@ -27,6 +27,70 @@ def _xdotool(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _x11_find_child_at(win, x: int, y: int):
+    """Walk the X11 window tree to find the deepest child containing (x, y).
+
+    Returns (child_window, child_x, child_y) where coords are relative to the
+    returned child. Sending events to a deep child avoids the top-level window
+    calling _NET_ACTIVE_WINDOW which would cause KWin to switch virtual desktops.
+    """
+    try:
+        children = win.query_tree().children
+    except Exception:
+        return win, x, y
+    for child in reversed(children):  # reversed = topmost z-order first
+        try:
+            geom = child.get_geometry()
+            if geom.x <= x < geom.x + geom.width and geom.y <= y < geom.y + geom.height:
+                return _x11_find_child_at(child, x - geom.x, y - geom.y)
+        except Exception:
+            continue
+    return win, x, y
+
+
+def _x11_send_click(window_id: int, abs_x: int, abs_y: int) -> None:
+    """Inject a left-click into a window via XSendEvent — no mouse movement, no focus change,
+    no virtual desktop switch. Targets the deepest child widget to avoid top-level WM activation.
+    """
+    try:
+        from Xlib import X, display as xdisplay
+        from Xlib.protocol import event as xevent
+
+        d = xdisplay.Display()
+        root = d.screen().root
+        top_win = d.create_resource_object("window", window_id)
+
+        # Get top-level window's screen position
+        coords = root.translate_coords(top_win, 0, 0)
+        wx, wy = coords.x, coords.y
+        win_x = abs_x - wx
+        win_y = abs_y - wy
+
+        # Walk the tree to find the deepest child at these coords — child widgets
+        # don't call _NET_ACTIVE_WINDOW so KWin won't switch virtual desktops
+        target_win, evt_x, evt_y = _x11_find_child_at(top_win, win_x, win_y)
+
+        common = dict(
+            time=X.CurrentTime,
+            root=root,
+            window=target_win,
+            child=X.NONE,
+            root_x=abs_x,
+            root_y=abs_y,
+            event_x=evt_x,
+            event_y=evt_y,
+            same_screen=True,
+        )
+        # event_mask=0 sends directly to the creating client, bypassing WM event selection
+        press = xevent.ButtonPress(detail=1, state=0, **common)
+        release = xevent.ButtonRelease(detail=1, state=X.Button1Mask, **common)
+        target_win.send_event(press, event_mask=0, propagate=False)
+        target_win.send_event(release, event_mask=0, propagate=False)
+        d.sync()
+    except Exception:
+        logger.exception("_x11_send_click failed for window %d", window_id)
+
+
 class Controller:
     def __init__(self, session: TargetSession) -> None:
         self._session = session
@@ -223,6 +287,24 @@ class Controller:
         else:
             await self.focus_window()
             _xdotool("mousemove", str(x), str(y), "click", "1")
+
+    async def background_click(self, x: int, y: int) -> None:
+        """Click at absolute screen coordinates via XSendEvent — no focus steal, no desktop switch."""
+        if self._target is None:
+            return
+        wid = self._target.window_id
+        if wid is None and self._target.tab_title:
+            # browser_tab targets don't store window_id — resolve via title
+            raw = _xdotool("search", "--name", self._target.tab_title)
+            if raw:
+                try:
+                    wid = int(raw.splitlines()[0].strip())
+                except ValueError:
+                    pass
+        if wid is None:
+            logger.warning("background_click: no window_id for target %s", self._target.display_name)
+            return
+        _x11_send_click(wid, x, y)
 
     async def type(self, text: str) -> None:
         """Type text into the focused element."""

@@ -27,8 +27,24 @@ def _make_rearview_icon(color: QColor, active: bool = False) -> QIcon:
     p = QPainter(px)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    # Mirror glass: wide rounded rectangle, upper portion
-    mx, my, mw, mh = 6, 8, 52, 30
+    # Mount at top: narrow bracket that clips to windshield
+    cx = _SZ // 2
+    sx, sy, sw, sh = cx - 4, 4, 8, 10
+    if active:
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawRect(sx, sy, sw, sh)
+        # Mounting bar across top
+        p.drawRect(sx - 8, sy, sw + 16, 4)
+    else:
+        pen2 = QPen(color, 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        p.setPen(pen2)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(sx - 8, sy + 2, sx + sw + 8, sy + 2)  # top bar
+        p.drawLine(cx, sy + 2, cx, sy + sh)               # stem down
+
+    # Mirror glass: wide rounded rectangle hanging below the mount
+    mx, my, mw, mh = 6, sy + sh, 52, 30
     if active:
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(color)
@@ -43,21 +59,6 @@ def _make_rearview_icon(color: QColor, active: bool = False) -> QIcon:
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(mx, my, mw, mh, 8, 8)
-
-    # Stem: narrow rect below mirror
-    sx, sy, sw, sh = 28, my + mh, 8, 12
-    if active:
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(color)
-        p.drawRect(sx, sy, sw, sh)
-        # Base foot
-        p.drawRect(sx - 6, sy + sh, sw + 12, 4)
-    else:
-        pen2 = QPen(color, 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-        p.setPen(pen2)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRect(sx, sy, sw, sh)
-        p.drawLine(sx - 6, sy + sh + 2, sx + sw + 6, sy + sh + 2)
 
     p.end()
     return QIcon(px.scaled(22, 22,

@@ -267,10 +267,23 @@ def start(
             store_v.save(target_key, _regions)
             QTimer.singleShot(0, _capture_and_update)
 
+        def _on_region_click(name: str, rel_x: float, rel_y: float) -> None:
+            region = next((r for r in _regions if r.name == name), None)
+            if region is None:
+                return
+            abs_x = int(region.x + rel_x * region.w)
+            abs_y = int(region.y + rel_y * region.h)
+            from rearview.controller import get_controller
+            asyncio.run_coroutine_threadsafe(
+                get_controller().background_click(abs_x, abs_y),
+                loop_v,
+            )
+
         viewer.region_renamed.connect(_on_region_renamed)
         viewer.region_deleted.connect(_on_region_deleted)
         viewer.region_remap_requested.connect(_on_region_remap_requested)
         viewer.region_reordered.connect(_on_region_reordered)
+        viewer.region_click_requested.connect(_on_region_click)
         viewer.drag_ended.connect(lambda: QTimer.singleShot(0, _capture_and_update))
 
         if not _regions:

@@ -48,7 +48,7 @@ class RegionStore:
     def load(self, target_key: str) -> list[Region]:
         data = self._load_all()
         raw = data.get(target_key, [])
-        return [Region(**r) for r in raw]
+        return [Region(**{k: v for k, v in r.items() if k in Region.__dataclass_fields__}) for r in raw]
 
     def save(self, target_key: str, regions: list[Region]) -> None:
         data = self._load_all()
