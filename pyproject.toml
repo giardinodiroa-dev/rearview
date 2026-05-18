@@ -23,6 +23,7 @@ dependencies = [
     "thefuzz>=0.22.1",
     "python-levenshtein>=0.25.1",
     "python-dotenv>=1.0.1",
+    "watchfiles>=0.21.0",
 ]
 
 [project.scripts]

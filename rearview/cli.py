@@ -81,6 +81,50 @@ def start(
     no_speech: bool = typer.Option(False, "--no-speech", help="Skip speech recognition"),
 ) -> None:
     """Launch virtual desktop + browser, start watcher and toast overlay."""
+    # ------------------------------------------------------------------
+    # Hot-reload wrapper — top-level process watches for .py changes and
+    # restarts the child. The child skips this block via env var.
+    # ------------------------------------------------------------------
+    if not os.environ.get("_REARVIEW_CHILD"):
+        import signal as _sig
+        import time as _time
+        from watchfiles import watch as _watch
+
+        _pkg = Path(__file__).parent
+        _cmd = [sys.executable] + sys.argv
+        _env = {**os.environ, "_REARVIEW_CHILD": "1"}
+
+        _proc: list = []
+
+        def _launch():
+            _proc.clear()
+            _proc.append(subprocess.Popen(_cmd, env=_env))
+
+        def _kill():
+            if _proc and _proc[0].poll() is None:
+                _proc[0].send_signal(_sig.SIGTERM)
+                try:
+                    _proc[0].wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _proc[0].kill()
+                    _proc[0].wait()
+
+        def _on_exit(sig, frame):
+            _kill()
+            raise SystemExit(0)
+
+        _sig.signal(_sig.SIGINT, _on_exit)
+        _sig.signal(_sig.SIGTERM, _on_exit)
+
+        _launch()
+        for _changes in _watch(_pkg, watch_filter=lambda _c, p: p.endswith(".py")):
+            _names = ", ".join(Path(p).name for _, p in _changes)
+            console.print(f"[yellow]↺ {_names}[/yellow] — reloading...")
+            _kill()
+            _time.sleep(0.3)
+            _launch()
+        return
+
     from rearview.config import get_config
     from rearview.desktop import DesktopManager
 
@@ -147,16 +191,16 @@ def start(
     # ------------------------------------------------------------------
     if _mode == "viewer":
         from PyQt6.QtWidgets import QApplication
-        from PyQt6.QtCore import QObject, QTimer, pyqtSignal as _pysig
+        from PyQt6.QtCore import QTimer
         from rearview.toast.viewer_toast import ViewerToast
         from rearview.ui.system_tray import RearviewTrayIcon
         from rearview.region_mapper import RegionStore, RegionMapperOverlay
-        from rearview.screen_capture import capture_all_regions
 
         qt_app_v = QApplication.instance() or QApplication(sys.argv)
         loop_v = asyncio.new_event_loop()
 
         target_key = target.tab_url or target.display_name
+        _wid = target.window_id
         store_v = RegionStore()
         _regions: list = store_v.load(target_key)
 
@@ -172,40 +216,10 @@ def start(
         )
         viewer.show()
 
-        # grabWindow must run on the Qt main thread
-        def _capture_and_update() -> None:
-            if not _regions:
-                viewer.update_regions([])
-                viewer.set_loading(False)
-                return
-            tiles = capture_all_regions(_regions, wid=target.window_id)
-            viewer.update_regions(tiles)
-            viewer.set_loading(False)
-
-        # Bridge: emit from any thread → slot runs on main thread
-        class _CaptureBridge(QObject):
-            trigger = _pysig()
-        _bridge = _CaptureBridge()
-        _bridge.trigger.connect(
-            lambda: _capture_and_update() if viewer._auto_checkbox.isChecked() else None
-        )
-
-        # Playwright response handler — called from Playwright's internal thread
-        def _on_response(response) -> None:
-            try:
-                ct = response.headers.get("content-type", "")
-                if any(t in ct for t in ("json", "html", "text")):
-                    viewer.set_loading(True)
-                    _bridge.trigger.emit()
-            except Exception:
-                pass
-
         async def _viewer_main() -> None:
             from rearview.controller import get_controller
             controller = get_controller()
             await controller.connect()
-            if controller.current_page:
-                controller.current_page.on("response", _on_response)
             while True:
                 await asyncio.sleep(1)
 
@@ -216,25 +230,23 @@ def start(
         def _on_map_requested() -> None:
             _overlay_ref.clear()
             overlay = RegionMapperOverlay(target_key, existing_regions=list(_regions))
-            _overlay_ref.append(overlay)  # prevent GC until done
+            _overlay_ref.append(overlay)
 
             def _on_regions_updated(new_regions: list) -> None:
                 _regions.clear()
                 _regions.extend(new_regions)
-                _overlay_ref.clear()  # release overlay
+                _overlay_ref.clear()
                 viewer.show()
                 viewer.raise_()
-                viewer.set_loading(True)
-                QTimer.singleShot(400, _capture_and_update)  # 400ms for compositor to fully remove overlay
+                # 400ms for compositor to fully remove the overlay before streaming starts
+                QTimer.singleShot(400, lambda: viewer.start_streaming(_regions, wid=_wid))
 
             overlay.regions_updated.connect(_on_regions_updated)
             overlay.cancelled.connect(lambda: _overlay_ref.clear())
             overlay.show()
 
         viewer.map_requested.connect(_on_map_requested)
-        viewer.refresh_requested.connect(
-            lambda: (viewer.set_loading(True), _capture_and_update())
-        )
+        viewer.refresh_requested.connect(lambda: viewer.start_streaming(_regions, wid=_wid))
 
         def _on_region_renamed(old_name: str, new_name: str) -> None:
             for r in _regions:
@@ -242,8 +254,7 @@ def start(
                     r.name = new_name
                     break
             store_v.save(target_key, _regions)
-            viewer.set_loading(True)
-            QTimer.singleShot(0, _capture_and_update)
+            viewer.start_streaming(_regions, wid=_wid)
 
         def _on_region_deleted(name: str) -> None:
             for r in list(_regions):
@@ -251,8 +262,7 @@ def start(
                     _regions.remove(r)
                     break
             store_v.save(target_key, _regions)
-            viewer.set_loading(True)
-            QTimer.singleShot(0, _capture_and_update)
+            viewer.start_streaming(_regions, wid=_wid)
 
         def _on_region_remap_requested(_name: str) -> None:
             _on_map_requested()
@@ -265,7 +275,7 @@ def start(
             item = _regions.pop(src_idx)
             _regions.insert(tgt_idx, item)
             store_v.save(target_key, _regions)
-            QTimer.singleShot(0, _capture_and_update)
+            viewer.start_streaming(_regions, wid=_wid)
 
         def _on_region_click(name: str, rel_x: float, rel_y: float) -> None:
             region = next((r for r in _regions if r.name == name), None)
@@ -284,26 +294,17 @@ def start(
         viewer.region_remap_requested.connect(_on_region_remap_requested)
         viewer.region_reordered.connect(_on_region_reordered)
         viewer.region_click_requested.connect(_on_region_click)
-        viewer.drag_ended.connect(lambda: QTimer.singleShot(0, _capture_and_update))
 
         if not _regions:
             QTimer.singleShot(500, _on_map_requested)
         else:
-            viewer.set_loading(True)
-            QTimer.singleShot(300, _capture_and_update)
+            viewer.start_streaming(_regions, wid=_wid)
 
         def _viewer_thread() -> None:
             asyncio.set_event_loop(loop_v)
             loop_v.run_until_complete(_viewer_main())
 
         threading.Thread(target=_viewer_thread, daemon=True, name="viewer-async").start()
-
-        _auto_timer = QTimer()
-        _auto_timer.setInterval(2000)
-        _auto_timer.timeout.connect(
-            lambda: _capture_and_update() if viewer._auto_checkbox.isChecked() else None
-        )
-        _auto_timer.start()
 
         qt_app_v.exec()
         loop_v.call_soon_threadsafe(loop_v.stop)

@@ -4,7 +4,7 @@ from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QScrollArea, QCheckBox, QFrame, QSizeGrip, QMenu, QSizePolicy, QLayout,
+    QScrollArea, QFrame, QSizeGrip, QMenu, QSizePolicy, QLayout,
 )
 from PyQt6.QtCore import Qt, QPoint, QSize, QTimer, pyqtSignal, QMimeData
 from PyQt6.QtGui import QGuiApplication, QPixmap, QDrag
@@ -219,7 +219,7 @@ class _RegionWidget(QFrame):
     reorder_requested = pyqtSignal(str, str)   # source_name, target_name
     click_requested   = pyqtSignal(str, float, float)  # name, rel_x, rel_y
 
-    def __init__(self, name: str, pixmap: QPixmap, parent=None):
+    def __init__(self, name: str, pixmap: QPixmap | None = None, parent=None):
         super().__init__(parent)
         self._name = name
         self.setObjectName("regionWidget")
@@ -329,7 +329,7 @@ class _RegionWidget(QFrame):
         self._resize_handle.reset.connect(self._on_resize_reset)
         layout.addWidget(self._resize_handle)
 
-        self._pixmap = pixmap
+        self._pixmap = pixmap if pixmap is not None else QPixmap()
         self._render_pixmap()
 
     def set_lean(self, lean: bool) -> None:
@@ -379,6 +379,14 @@ class _RegionWidget(QFrame):
     def update_pixmap(self, pixmap: QPixmap) -> None:
         self._pixmap = pixmap
         self._render_pixmap()
+
+    def connect_streamer(self, streamer) -> None:
+        """Wire a RegionStreamer so each frame updates this widget."""
+        streamer.frame_ready.connect(self._on_stream_frame)
+
+    def _on_stream_frame(self, px: QPixmap) -> None:
+        self._pixmap = px
+        self._render_pixmap(smooth=False)
 
     def minimumSizeHint(self) -> QSize:
         return QSize(0, 0)
@@ -466,8 +474,9 @@ class ViewerToast(QWidget):
     region_click_requested  = pyqtSignal(str, float, float)  # name, rel_x, rel_y
 
     # Internal signals for thread-safe calls from background threads
-    _sig_update = pyqtSignal(object)   # list[tuple[str, QPixmap]]
+    _sig_update  = pyqtSignal(object)   # list[tuple[str, QPixmap]]
     _sig_loading = pyqtSignal(bool)
+    _sig_stream  = pyqtSignal(object)   # list[Region]
 
     def __init__(self, target_name: str = "", parent=None):
         super().__init__(parent)
@@ -475,6 +484,7 @@ class ViewerToast(QWidget):
         self._drag_pos: QPoint | None = None
         self._pinned = True
         self._region_widgets: list[_RegionWidget] = []
+        self._streamers: list = []
         self._card_dragging = False  # True while a card QDrag is in exec()
         self._layout_horizontal = False
 
@@ -489,6 +499,7 @@ class ViewerToast(QWidget):
         # Wire internal signals to main-thread handlers
         self._sig_update.connect(self._do_update_regions)
         self._sig_loading.connect(self._do_set_loading)
+        self._sig_stream.connect(self._do_start_streaming)
 
         # Debounce timer for resize re-render
         self._resize_debounce = QTimer()
@@ -714,21 +725,8 @@ class ViewerToast(QWidget):
             f"color: {_TEXT_DIM}; font-size: 11px;"
         )
 
-        self._auto_checkbox = QCheckBox("Auto-refresh")
-        self._auto_checkbox.setStyleSheet(
-            f"color: {_TEXT_DIM}; font-size: 11px;"
-        )
-
-        self._loading_label = QLabel("Loading…")
-        self._loading_label.setStyleSheet(
-            f"color: {_ACCENT}; font-size: 11px;"
-        )
-        self._loading_label.hide()
-
         layout.addWidget(self._status_label)
         layout.addStretch()
-        layout.addWidget(self._auto_checkbox)
-        layout.addWidget(self._loading_label)
 
         return bar
 
@@ -999,6 +997,64 @@ class ViewerToast(QWidget):
             self._loading_label.show()
         else:
             self._loading_label.hide()
+
+    # ------------------------------------------------------------------
+    # Streaming
+    # ------------------------------------------------------------------
+
+    def start_streaming(self, regions: list, wid: int | None = None) -> None:
+        """Thread-safe. Stop existing streams, create widgets, start one streamer per region."""
+        self._sig_stream.emit((list(regions), wid))
+
+    def _stop_streamers(self) -> None:
+        for s in self._streamers:
+            s.stop()
+        self._streamers.clear()
+
+    def _do_start_streaming(self, payload: tuple) -> None:
+        """Main-thread slot: rebuild widgets and launch a RegionStreamer per region."""
+        from rearview.region_streamer import RegionStreamer
+
+        regions, wid = payload
+        self._stop_streamers()
+
+        if self._card_dragging:
+            return
+
+        for rw in self._region_widgets:
+            self._content_layout.removeWidget(rw)
+            rw.deleteLater()
+        self._region_widgets.clear()
+
+        for region in regions:
+            rw = _RegionWidget(region.name, parent=self._content_widget)
+            if self._layout_horizontal:
+                self._content_layout.addWidget(rw)
+            else:
+                self._content_layout.insertWidget(self._content_layout.count() - 1, rw)
+            self._region_widgets.append(rw)
+            rw.rename_requested.connect(self._on_rename_region)
+            rw.delete_requested.connect(self._on_delete_region)
+            rw.remap_requested.connect(self._on_remap_region)
+            rw.reorder_requested.connect(self._on_reorder)
+            rw.click_requested.connect(self.region_click_requested)
+
+            streamer = RegionStreamer(region, wid=wid, parent=self)
+            rw.connect_streamer(streamer)
+            streamer.start()
+            self._streamers.append(streamer)
+
+        if not self._header_visible:
+            for rw in self._region_widgets:
+                rw.set_lean(True)
+
+        count = len(regions)
+        self._count_label.setText(f"{count} region{'s' if count != 1 else ''}")
+        self._status_label.setText("Streaming")
+
+    def closeEvent(self, event) -> None:
+        self._stop_streamers()
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------
     # Public API
