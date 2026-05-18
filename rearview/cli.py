@@ -200,9 +200,9 @@ def start(
         loop_v = asyncio.new_event_loop()
 
         target_key = target.tab_url or target.display_name
-        _wid = target.window_id
         store_v = RegionStore()
         _regions: list = store_v.load(target_key)
+        _viewer_target = target
 
         tray_v = RearviewTrayIcon()
         tray_v.set_status("connected")
@@ -239,14 +239,14 @@ def start(
                 viewer.show()
                 viewer.raise_()
                 # 400ms for compositor to fully remove the overlay before streaming starts
-                QTimer.singleShot(400, lambda: viewer.start_streaming(_regions, wid=_wid))
+                QTimer.singleShot(400, lambda: viewer.start_streaming(_regions, target=_viewer_target))
 
             overlay.regions_updated.connect(_on_regions_updated)
             overlay.cancelled.connect(lambda: _overlay_ref.clear())
             overlay.show()
 
         viewer.map_requested.connect(_on_map_requested)
-        viewer.refresh_requested.connect(lambda: viewer.start_streaming(_regions, wid=_wid))
+        viewer.refresh_requested.connect(lambda: viewer.start_streaming(_regions, target=_viewer_target))
 
         def _on_region_renamed(old_name: str, new_name: str) -> None:
             for r in _regions:
@@ -254,7 +254,7 @@ def start(
                     r.name = new_name
                     break
             store_v.save(target_key, _regions)
-            viewer.start_streaming(_regions, wid=_wid)
+            viewer.start_streaming(_regions, target=_viewer_target)
 
         def _on_region_deleted(name: str) -> None:
             for r in list(_regions):
@@ -262,7 +262,7 @@ def start(
                     _regions.remove(r)
                     break
             store_v.save(target_key, _regions)
-            viewer.start_streaming(_regions, wid=_wid)
+            viewer.start_streaming(_regions, target=_viewer_target)
 
         def _on_region_remap_requested(_name: str) -> None:
             _on_map_requested()
@@ -275,7 +275,7 @@ def start(
             item = _regions.pop(src_idx)
             _regions.insert(tgt_idx, item)
             store_v.save(target_key, _regions)
-            viewer.start_streaming(_regions, wid=_wid)
+            viewer.start_streaming(_regions, target=_viewer_target)
 
         def _on_region_click(name: str, rel_x: float, rel_y: float) -> None:
             region = next((r for r in _regions if r.name == name), None)
@@ -298,7 +298,7 @@ def start(
         if not _regions:
             QTimer.singleShot(500, _on_map_requested)
         else:
-            viewer.start_streaming(_regions, wid=_wid)
+            viewer.start_streaming(_regions, target=_viewer_target)
 
         def _viewer_thread() -> None:
             asyncio.set_event_loop(loop_v)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from typing import Any
@@ -289,9 +290,62 @@ class Controller:
             _xdotool("mousemove", str(x), str(y), "click", "1")
 
     async def background_click(self, x: int, y: int) -> None:
-        """Click at absolute screen coordinates via XSendEvent — no focus steal, no desktop switch."""
+        """Click at absolute screen coordinates without focus steal or desktop switch.
+
+        For browser_tab targets with an active Playwright page, dispatches the click
+        via CDP (page.mouse.click) using computed viewport coordinates.
+        For all other targets, falls back to XSendEvent via _x11_send_click.
+        """
         if self._target is None:
             return
+
+        if self._target.type == "browser_tab" and self._page is not None:
+            # Resolve the browser window position so we can convert abs → viewport coords.
+            wx, wy = 0, 0
+            try:
+                port = int(self._target.cdp_url.split(":")[-1])
+                ss_result = subprocess.run(
+                    ["ss", "-tlnp", f"sport = :{port}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                pid_match = re.search(r"pid=(\d+)", ss_result.stdout)
+                if pid_match:
+                    pid = pid_match.group(1)
+                    xdo_result = _xdotool("search", "--pid", pid)
+                    if xdo_result.returncode == 0:
+                        lines = [ln.strip() for ln in xdo_result.stdout.splitlines() if ln.strip()]
+                        if lines:
+                            try:
+                                wid = int(lines[0])
+                                geom_result = _xdotool("getwindowgeometry", "--shell", str(wid))
+                                if geom_result.returncode == 0:
+                                    for line in geom_result.stdout.splitlines():
+                                        if line.startswith("X="):
+                                            wx = int(line.split("=", 1)[1])
+                                        elif line.startswith("Y="):
+                                            wy = int(line.split("=", 1)[1])
+                            except (ValueError, IndexError):
+                                pass
+            except Exception:
+                logger.debug("background_click: could not resolve browser window position", exc_info=True)
+
+            try:
+                info = await self._page.evaluate(
+                    "() => ({dpr: window.devicePixelRatio, chromeH: window.outerHeight - window.innerHeight})"
+                )
+            except Exception:
+                info = {}
+
+            dpr = info.get("dpr", 1.0)
+            chrome_h = info.get("chromeH", 0)
+            vx = (x - wx) / dpr
+            vy = (y - wy) / dpr - chrome_h
+            await self._page.mouse.click(max(0.0, vx), max(0.0, vy))
+            return
+
+        # XSendEvent path for x11_app targets (and browser_tab with no active page).
         wid = self._target.window_id
         if wid is None and self._target.tab_title:
             # browser_tab targets don't store window_id — resolve via title

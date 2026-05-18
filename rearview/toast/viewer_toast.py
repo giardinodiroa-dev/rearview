@@ -384,8 +384,8 @@ class _RegionWidget(QFrame):
         """Wire a RegionStreamer so each frame updates this widget."""
         streamer.frame_ready.connect(self._on_stream_frame)
 
-    def _on_stream_frame(self, px: QPixmap) -> None:
-        self._pixmap = px
+    def _on_stream_frame(self, img) -> None:
+        self._pixmap = QPixmap.fromImage(img)
         self._render_pixmap(smooth=False)
 
     def minimumSizeHint(self) -> QSize:
@@ -1002,9 +1002,9 @@ class ViewerToast(QWidget):
     # Streaming
     # ------------------------------------------------------------------
 
-    def start_streaming(self, regions: list, wid: int | None = None) -> None:
+    def start_streaming(self, regions: list, target=None) -> None:
         """Thread-safe. Stop existing streams, create widgets, start one streamer per region."""
-        self._sig_stream.emit((list(regions), wid))
+        self._sig_stream.emit((list(regions), target))
 
     def _stop_streamers(self) -> None:
         for s in self._streamers:
@@ -1015,7 +1015,7 @@ class ViewerToast(QWidget):
         """Main-thread slot: rebuild widgets and launch a RegionStreamer per region."""
         from rearview.region_streamer import RegionStreamer
 
-        regions, wid = payload
+        regions, target = payload
         self._stop_streamers()
 
         if self._card_dragging:
@@ -1039,7 +1039,7 @@ class ViewerToast(QWidget):
             rw.reorder_requested.connect(self._on_reorder)
             rw.click_requested.connect(self.region_click_requested)
 
-            streamer = RegionStreamer(region, wid=wid, parent=self)
+            streamer = RegionStreamer(region, target=target, parent=self)
             rw.connect_streamer(streamer)
             streamer.start()
             self._streamers.append(streamer)
