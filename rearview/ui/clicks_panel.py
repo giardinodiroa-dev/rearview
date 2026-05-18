@@ -310,9 +310,6 @@ class ClicksPanel(QWidget):
         chain = next((c for c in self._chains if c.id == chain_id), None)
         if chain is None:
             return
-        region = self._current_region()
-        if region is None:
-            return
         dot_map = {d.id: d for d in self._dots}
 
         loop = self._loop
@@ -325,5 +322,5 @@ class ClicksPanel(QWidget):
 
         executor = ClickExecutor(loop)
         asyncio.run_coroutine_threadsafe(
-            executor.run_chain(chain, region, dot_map), loop
+            executor.run_chain(chain, dot_map), loop
         )

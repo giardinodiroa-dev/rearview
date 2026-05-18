@@ -3,7 +3,6 @@ import logging
 
 from rearview.click_store import ClickChain, ClickDot
 from rearview.controller import get_controller
-from rearview.region_mapper import Region
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +16,6 @@ class ClickExecutor:
     async def run_chain(
         self,
         chain: ClickChain,
-        region: Region,
         dots: dict[str, ClickDot],
     ) -> None:
         self._running = True
@@ -37,8 +35,9 @@ class ClickExecutor:
                         step.dot_id,
                     )
                     continue
-                abs_x = region.x + int(dot.rx * region.w)
-                abs_y = region.y + int(dot.ry * region.h)
+                # rx/ry are absolute screen coords when placed via the overlay
+                abs_x = int(dot.rx)
+                abs_y = int(dot.ry)
                 await get_controller().background_click(abs_x, abs_y)
                 logger.info(
                     "ClickExecutor: [%s] clicked %s at (%d,%d)",

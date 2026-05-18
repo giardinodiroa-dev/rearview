@@ -9,7 +9,6 @@ from pynput import keyboard
 
 from rearview.click_executor import get_click_executor
 from rearview.click_store import ClickChain, get_click_store
-from rearview.region_mapper import RegionStore
 from rearview.target_selector import get_session
 
 logger = logging.getLogger(__name__)
@@ -91,24 +90,9 @@ class ClickHotkeyManager:
                 def _trigger() -> None:
                     target_key = _resolve_target_key()
                     dots = store.dots_for_chain(target_key, c)
-                    regions = RegionStore().load(target_key)
-                    region = next((r for r in regions if r.name == c.region_name), None)
-                    if region is None:
-                        logger.warning(
-                            "ClickHotkeyManager: hotkey %r fired for chain %r but region %r not found",
-                            c.hotkey,
-                            c.name,
-                            c.region_name,
-                        )
-                        return
-                    logger.info(
-                        "ClickHotkeyManager: hotkey %r → chain %r region %r",
-                        c.hotkey,
-                        c.name,
-                        c.region_name,
-                    )
+                    logger.info("ClickHotkeyManager: hotkey %r → chain %r", c.hotkey, c.name)
                     asyncio.run_coroutine_threadsafe(
-                        executor.run_chain(c, region, dots), self.loop
+                        executor.run_chain(c, dots), self.loop
                     )
 
                 return _trigger

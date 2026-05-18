@@ -10,7 +10,9 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt, QPoint, QRect, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QGuiApplication
-from PyQt6.QtWidgets import QWidget, QLabel, QPushButton, QInputDialog, QMenu
+from PyQt6.QtWidgets import QWidget, QLabel, QPushButton, QInputDialog, QMenu, QHBoxLayout
+
+from rearview.click_store import ClickDot, get_click_store
 
 
 # ---------------------------------------------------------------------------
@@ -82,11 +84,14 @@ class RegionMapperOverlay(QWidget):
         self,
         target_key: str,
         existing_regions: Optional[list[Region]] = None,
+        existing_dots: Optional[list[ClickDot]] = None,
         parent=None,
     ):
         super().__init__(parent)
         self._target_key = target_key
         self._regions: list[Region] = list(existing_regions) if existing_regions else []
+        self._dots: list[ClickDot] = list(existing_dots) if existing_dots else []
+        self._tool: str = "rect"   # "rect" | "dot"
         self._drawing = False
         self._start: QPoint = QPoint()
         self._current_rect: Optional[QRect] = None
@@ -110,7 +115,42 @@ class RegionMapperOverlay(QWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        # Instruction banner
+        # Tool bar — floating container at top-center
+        self._toolbar = QWidget(self)
+        toolbar_layout = QHBoxLayout(self._toolbar)
+        toolbar_layout.setContentsMargins(8, 6, 8, 6)
+        toolbar_layout.setSpacing(6)
+        self._toolbar.setStyleSheet(
+            "background: rgba(0,0,0,200);"
+            "border-radius: 6px;"
+        )
+
+        _btn_base = (
+            "QPushButton { color: #aaa; background: transparent; border: none;"
+            " border-radius: 4px; padding: 4px 14px; font-size: 13px; }"
+            "QPushButton:hover { background: rgba(255,255,255,15); color: white; }"
+        )
+        _btn_active = (
+            "QPushButton { color: white; background: #6366f1; border: none;"
+            " border-radius: 4px; padding: 4px 14px; font-size: 13px; }"
+        )
+
+        self._btn_rect = QPushButton("▭  Region", self._toolbar)
+        self._btn_rect.setStyleSheet(_btn_active)
+        self._btn_rect.clicked.connect(lambda: self._set_tool("rect"))
+
+        self._btn_dot = QPushButton("•  Dot", self._toolbar)
+        self._btn_dot.setStyleSheet(_btn_base)
+        self._btn_dot.clicked.connect(lambda: self._set_tool("dot"))
+
+        toolbar_layout.addWidget(self._btn_rect)
+        toolbar_layout.addWidget(self._btn_dot)
+        self._toolbar.adjustSize()
+        self._toolbar.move(
+            (self.width() - self._toolbar.width()) // 2, 12
+        )
+
+        # Instruction banner (below toolbar)
         self._banner = QLabel(
             "Draw rectangles over content areas  •  Right-click to rename/delete  •  ESC when done",
             self,
@@ -118,15 +158,15 @@ class RegionMapperOverlay(QWidget):
         self._banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._banner.setStyleSheet(
             "color: white;"
-            "background: rgba(0,0,0,180);"
-            "padding: 6px 16px;"
-            "font-size: 13px;"
+            "background: rgba(0,0,0,160);"
+            "padding: 5px 14px;"
+            "font-size: 12px;"
             "border-radius: 4px;"
         )
         self._banner.adjustSize()
         self._banner.move(
             (self.width() - self._banner.width()) // 2,
-            12,
+            self._toolbar.y() + self._toolbar.height() + 6,
         )
 
         # Done button
@@ -196,6 +236,20 @@ class RegionMapperOverlay(QWidget):
             painter.setBrush(QBrush(fill))
             painter.drawRect(self._current_rect.normalized())
 
+        # Click dots (rx/ry stored as absolute screen pixel coords)
+        dot_font = QFont()
+        dot_font.setPointSize(9)
+        dot_font.setBold(True)
+        painter.setFont(dot_font)
+        for i, dot in enumerate(self._dots):
+            color = QColor(self._COLORS[i % len(self._COLORS)])
+            cx, cy = int(dot.rx), int(dot.ry)
+            painter.setPen(QPen(QColor("white"), 1))
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(QPoint(cx, cy), 8, 8)
+            painter.setPen(QPen(QColor("white")))
+            painter.drawText(cx + 12, cy + 4, dot.label)
+
         painter.end()
 
     # ------------------------------------------------------------------
@@ -204,16 +258,26 @@ class RegionMapperOverlay(QWidget):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            hit = self._region_at(event.pos())
-            if hit is None:
-                self._drawing = True
-                self._start = event.pos()
-                self._current_rect = QRect(self._start, self._start)
+            if self._tool == "dot":
+                pos = event.pos()
+                label = f"Dot {len(self._dots) + 1}"
+                self._dots.append(ClickDot.new(label, float(pos.x()), float(pos.y())))
                 self.update()
+            else:
+                hit = self._region_at(event.pos())
+                if hit is None:
+                    self._drawing = True
+                    self._start = event.pos()
+                    self._current_rect = QRect(self._start, self._start)
+                    self.update()
         elif event.button() == Qt.MouseButton.RightButton:
-            hit = self._region_at(event.pos())
-            if hit is not None:
-                self._show_context_menu(event.globalPosition().toPoint(), hit)
+            dot_hit = self._dot_at(event.pos())
+            if dot_hit is not None:
+                self._show_dot_context_menu(event.globalPosition().toPoint(), dot_hit)
+            else:
+                hit = self._region_at(event.pos())
+                if hit is not None:
+                    self._show_context_menu(event.globalPosition().toPoint(), hit)
 
     def mouseMoveEvent(self, event) -> None:
         if self._drawing:
@@ -244,6 +308,53 @@ class RegionMapperOverlay(QWidget):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _set_tool(self, tool: str) -> None:
+        self._tool = tool
+        _active = (
+            "QPushButton { color: white; background: #6366f1; border: none;"
+            " border-radius: 4px; padding: 4px 14px; font-size: 13px; }"
+        )
+        _inactive = (
+            "QPushButton { color: #aaa; background: transparent; border: none;"
+            " border-radius: 4px; padding: 4px 14px; font-size: 13px; }"
+            "QPushButton:hover { background: rgba(255,255,255,15); color: white; }"
+        )
+        self._btn_rect.setStyleSheet(_active if tool == "rect" else _inactive)
+        self._btn_dot.setStyleSheet(_active if tool == "dot" else _inactive)
+        hint = (
+            "Draw rectangles over content areas  •  Right-click to rename/delete  •  ESC when done"
+            if tool == "rect" else
+            "Click anywhere to place a dot  •  Right-click dot to rename/delete  •  ESC when done"
+        )
+        self._banner.setText(hint)
+        self._banner.adjustSize()
+        self._banner.move(
+            (self.width() - self._banner.width()) // 2,
+            self._toolbar.y() + self._toolbar.height() + 6,
+        )
+
+    def _dot_at(self, pos: QPoint) -> Optional[ClickDot]:
+        for dot in self._dots:
+            dx = pos.x() - int(dot.rx)
+            dy = pos.y() - int(dot.ry)
+            if dx * dx + dy * dy <= 12 * 12:
+                return dot
+        return None
+
+    def _show_dot_context_menu(self, global_pos: QPoint, dot: ClickDot) -> None:
+        menu = QMenu(self)
+        rename_action = menu.addAction("Rename")
+        delete_action = menu.addAction("Delete")
+        chosen = menu.exec(global_pos)
+        if chosen == rename_action:
+            new_name, ok = QInputDialog.getText(self, "Rename dot", "Name:", text=dot.label)
+            if ok and new_name.strip():
+                dot.label = new_name.strip()
+                self.update()
+        elif chosen == delete_action:
+            self._dots.remove(dot)
+            self.update()
 
     def _region_at(self, pos: QPoint) -> Optional[Region]:
         for region in self._regions:
@@ -298,5 +409,7 @@ class RegionMapperOverlay(QWidget):
     def _on_done(self) -> None:
         store = RegionStore()
         store.save(self._target_key, self._regions)
+        # Save dots keyed to target; use "_overlay" as region_name since dots are screen-absolute
+        get_click_store().save_dots(self._target_key, "_overlay", list(self._dots))
         self.regions_updated.emit(list(self._regions))
         self.close()
