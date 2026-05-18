@@ -138,6 +138,7 @@ class _ScriptNameBar(QWidget):
 class RegionMapperOverlay(QWidget):
     regions_updated = pyqtSignal(list)
     cancelled = pyqtSignal()
+    script_saved = pyqtSignal(str)   # emits target_key so toast can reload
 
     _COLORS = [
         "#6366f1",
@@ -553,42 +554,47 @@ class RegionMapperOverlay(QWidget):
             self.update()
 
     def _on_save_script(self, name: str) -> None:
-        if not self._dots or not self._connections:
+        if not self._dots:
+            self._script_name_bar.show_feedback("⚠ Place dots first")
             return
-        # Build ordered steps from connections (chain: follow from first dot)
-        dot_map = {d.id: d for d in self._dots}
-        # Find start: dot that is never a "to" in any connection
-        to_ids = {c[1] for c in self._connections}
-        starts = [d for d in self._dots if d.id not in to_ids]
-        start_id = starts[0].id if starts else self._connections[0][0]
-        # Walk the chain
-        conn_map: dict[str, tuple[str, float]] = {c[0]: (c[1], c[2]) for c in self._connections}
-        steps = []
-        visited: set[str] = set()
-        cur = start_id
-        first = True
-        while cur and cur not in visited:
-            visited.add(cur)
-            nxt = conn_map.get(cur)
-            delay = 0.0 if first else (
-                next((c[2] for c in self._connections if c[1] == cur), 0.0)
-            )
-            steps.append(ChainStep(dot_id=cur, delay_before=delay))
-            first = False
-            cur = nxt[0] if nxt else None
+
+        steps: list[ChainStep] = []
+
+        if self._connections:
+            # Build ordered steps by walking the connection graph
+            to_ids = {c[1] for c in self._connections}
+            starts = [d for d in self._dots if d.id not in to_ids]
+            start_id = starts[0].id if starts else self._connections[0][0]
+            conn_map: dict[str, tuple[str, float]] = {c[0]: (c[1], c[2]) for c in self._connections}
+            visited: set[str] = set()
+            cur: str | None = start_id
+            first = True
+            while cur and cur not in visited:
+                visited.add(cur)
+                delay = 0.0 if first else next(
+                    (c[2] for c in self._connections if c[1] == cur), 0.0
+                )
+                steps.append(ChainStep(dot_id=cur, delay_before=delay))
+                first = False
+                nxt = conn_map.get(cur)
+                cur = nxt[0] if nxt else None
+        else:
+            # No connections → treat all dots as a sequential chain with 0.5s delays
+            for i, dot in enumerate(self._dots):
+                steps.append(ChainStep(dot_id=dot.id, delay_before=0.0 if i == 0 else 0.5))
 
         chain = ClickChain.new(name, "_overlay")
         chain.steps = steps
 
         store = get_click_store()
         existing = store.load_chains(self._target_key, "_overlay")
-        # Upsert by name
         existing = [c for c in existing if c.name != name]
         existing.append(chain)
         store.save_chains(self._target_key, "_overlay", existing)
         store.save_dots(self._target_key, "_overlay", list(self._dots))
 
-        self._script_name_bar.show_feedback("Saved!")
+        self._script_name_bar.show_feedback("✓ Saved!")
+        self.script_saved.emit(self._target_key)
 
     def _region_at(self, pos: QPoint) -> Optional[Region]:
         for region in self._regions:

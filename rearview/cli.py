@@ -244,6 +244,7 @@ def start(
 
             overlay.regions_updated.connect(_on_regions_updated)
             overlay.cancelled.connect(lambda: _overlay_ref.clear())
+            overlay.script_saved.connect(lambda _key: viewer._reload_scripts())
             overlay.show()
 
         viewer.map_requested.connect(_on_map_requested)
