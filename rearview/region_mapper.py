@@ -4,18 +4,16 @@ region_mapper.py — PyQt6 fullscreen transparent overlay for defining named cap
 from __future__ import annotations
 
 import json
-import threading
-import time
+import math
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QPoint, QRect, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QPoint, QRect, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QGuiApplication
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QInputDialog, QMenu,
-    QHBoxLayout, QVBoxLayout, QListWidget, QListWidgetItem,
-    QLineEdit, QScrollArea, QDoubleSpinBox, QSplitter,
+    QHBoxLayout, QVBoxLayout, QLineEdit,
 )
 
 from rearview.click_store import ClickDot, ClickChain, ChainStep, get_click_store
@@ -70,435 +68,67 @@ class RegionStore:
 
 
 # ---------------------------------------------------------------------------
-# _ClickRecorderThread
+# _ScriptNameBar
 # ---------------------------------------------------------------------------
 
-class _ClickRecorderThread(QThread):
-    """Records left-clicks and maps them to nearest ClickDot within 20px."""
+class _ScriptNameBar(QWidget):
+    save_requested = pyqtSignal(str)   # emits the script name
 
-    recorded = pyqtSignal(list)  # list of (dot_label, delay_before) tuples
-
-    def __init__(self, dots: list[ClickDot], parent=None) -> None:
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._dots = dots
-        self._stop_event = threading.Event()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-
-    def run(self) -> None:
-        try:
-            from pynput import mouse as _mouse
-        except ImportError:
-            self.recorded.emit([])
-            return
-
-        clicks: list[tuple[float, int, int]] = []
-
-        def on_click(x, y, button, pressed):
-            if self._stop_event.is_set():
-                return False
-            if pressed and button.name == "left":
-                clicks.append((time.time(), int(x), int(y)))
-
-        with _mouse.Listener(on_click=on_click) as lst:
-            self._stop_event.wait(timeout=60)
-            lst.stop()
-
-        steps: list[tuple[str, float]] = []
-        prev_t: Optional[float] = None
-        for t, x, y in clicks:
-            delay = 0.0 if prev_t is None else t - prev_t
-            prev_t = t
-            best_dot: Optional[ClickDot] = None
-            best_dist = 20 * 20 + 1
-            for dot in self._dots:
-                dx = x - int(dot.rx)
-                dy = y - int(dot.ry)
-                dist = dx * dx + dy * dy
-                if dist <= 20 * 20 and dist < best_dist:
-                    best_dist = dist
-                    best_dot = dot
-            if best_dot is not None:
-                steps.append((best_dot.label, delay))
-
-        self.recorded.emit(steps)
-
-
-# ---------------------------------------------------------------------------
-# _HotkeyCapture
-# ---------------------------------------------------------------------------
-
-class _HotkeyCapture(QThread):
-    """Captures one key combo via pynput and emits it as a formatted string."""
-
-    captured = pyqtSignal(str)
-
-    _MOD_ORDER = ["ctrl", "alt", "shift", "cmd"]
-
-    def run(self) -> None:
-        try:
-            from pynput import keyboard as _kb
-        except ImportError:
-            self.captured.emit("")
-            return
-
-        held: set[str] = set()
-        done = threading.Event()
-        result: list[str] = []
-
-        def _fmt(mods: list[str], key_name: str) -> str:
-            parts = [f"<{m}>" for m in self._MOD_ORDER if m in mods]
-            if key_name and key_name not in self._MOD_ORDER:
-                parts.append(f"<{key_name}>" if len(key_name) > 1 else key_name)
-            return "".join(parts)
-
-        def _key_name(key) -> str:
-            try:
-                return key.char or ""
-            except AttributeError:
-                name = str(key).replace("Key.", "")
-                for alias, canonical in (
-                    ("ctrl_l", "ctrl"), ("ctrl_r", "ctrl"),
-                    ("alt_l", "alt"), ("alt_r", "alt"),
-                    ("shift", "shift"), ("shift_l", "shift"), ("shift_r", "shift"),
-                    ("cmd", "cmd"), ("cmd_l", "cmd"), ("cmd_r", "cmd"),
-                    ("super_l", "cmd"), ("super_r", "cmd"),
-                ):
-                    if name == alias:
-                        return canonical
-                return name
-
-        _MODIFIERS = {"ctrl", "alt", "shift", "cmd"}
-
-        def on_press(key):
-            held.add(_key_name(key))
-
-        def on_release(key):
-            name = _key_name(key)
-            mods = [m for m in held if m in _MODIFIERS]
-            non_mods = [k for k in held if k not in _MODIFIERS]
-            if not done.is_set() and held:
-                key_part = non_mods[0] if non_mods else (mods[0] if mods else name)
-                mods_only = [m for m in mods if m != key_part]
-                result.append(_fmt(mods_only, key_part))
-                done.set()
-            held.discard(name)
-            if done.is_set():
-                return False
-
-        with _kb.Listener(on_press=on_press, on_release=on_release) as lst:
-            done.wait(timeout=10)
-            lst.stop()
-
-        self.captured.emit(result[0] if result else "")
-
-
-# ---------------------------------------------------------------------------
-# _DotScriptPanel
-# ---------------------------------------------------------------------------
-
-class _DotScriptPanel(QWidget):
-    """Floating dark panel for building click-chain scripts from overlay dots."""
-
-    chain_saved = pyqtSignal(ClickChain)
-
-    _ACCENT = "#6366f1"
-    _BG = "rgba(15,15,15,230)"
-    _BORDER = "#2a2a2a"
-    _TEXT = "#e5e7eb"
-    _MUTED = "#6b7280"
-    _INPUT_BG = "#1a1a1a"
-
-    def __init__(self, target_key: str, parent=None) -> None:
-        super().__init__(parent)
-        self._target_key = target_key
-        self._steps: list[tuple[ClickDot, float]] = []
-        self._dots: list[ClickDot] = []
-        self._recorder: Optional[_ClickRecorderThread] = None
-        self._capture_worker: Optional[_HotkeyCapture] = None
-
-        self.setFixedWidth(290)
+        self.setFixedHeight(40)
         self.setStyleSheet(
-            f"background: {self._BG};"
-            f"border: 1px solid {self._BORDER};"
-            "border-radius: 8px;"
+            "background: rgba(10,10,10,220); border-radius: 6px;"
         )
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setSpacing(8)
 
-        self._build_ui()
+        lbl = QLabel("Script name:")
+        lbl.setStyleSheet("color: #888; font-size: 12px;")
 
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
-
-    def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(6)
-
-        # Title
-        title = QLabel("Scripts")
-        title.setStyleSheet(
-            f"color: {self._TEXT}; font-size: 13px; font-weight: bold;"
-            "border: none; background: transparent;"
-        )
-        root.addWidget(title)
-
-        _sep_style = f"color: {self._MUTED}; font-size: 11px; border: none; background: transparent;"
-
-        # Available dots label
-        dots_lbl = QLabel("Available dots:")
-        dots_lbl.setStyleSheet(_sep_style)
-        root.addWidget(dots_lbl)
-
-        # Chip row (scrollable)
-        self._chip_scroll = QScrollArea()
-        self._chip_scroll.setFixedHeight(36)
-        self._chip_scroll.setWidgetResizable(True)
-        self._chip_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._chip_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._chip_scroll.setStyleSheet(
-            f"background: transparent; border: 1px solid {self._BORDER}; border-radius: 4px;"
-        )
-        self._chip_container = QWidget()
-        self._chip_layout = QHBoxLayout(self._chip_container)
-        self._chip_layout.setContentsMargins(4, 2, 4, 2)
-        self._chip_layout.setSpacing(4)
-        self._chip_layout.addStretch()
-        self._chip_scroll.setWidget(self._chip_container)
-        root.addWidget(self._chip_scroll)
-
-        # Sequence label
-        seq_lbl = QLabel("Sequence:")
-        seq_lbl.setStyleSheet(_sep_style)
-        root.addWidget(seq_lbl)
-
-        # Sequence list
-        self._seq_list = QListWidget()
-        self._seq_list.setFixedHeight(120)
-        self._seq_list.setStyleSheet(
-            "QListWidget {"
-            f"  background: #111; border: 1px solid {self._BORDER};"
-            f"  color: {self._TEXT}; font-size: 12px; border-radius: 4px;"
-            "}"
-            "QListWidget::item:selected {"
-            f"  background: {self._ACCENT}; color: white;"
-            "}"
-        )
-        self._seq_list.itemDoubleClicked.connect(self._edit_step_delay)
-        root.addWidget(self._seq_list)
-
-        # Reorder / delete buttons
-        order_row = QHBoxLayout()
-        order_row.setSpacing(4)
-        for label, slot in (("↑", self._move_up), ("↓", self._move_down), ("×", self._remove_step)):
-            btn = QPushButton(label)
-            btn.setFixedHeight(26)
-            btn.setStyleSheet(self._btn_style())
-            btn.clicked.connect(slot)
-            order_row.addWidget(btn)
-        order_row.addStretch()
-        root.addLayout(order_row)
-
-        # Name field
-        name_lbl = QLabel("Name:")
-        name_lbl.setStyleSheet(_sep_style)
-        root.addWidget(name_lbl)
         self._name_edit = QLineEdit()
-        self._name_edit.setFixedHeight(26)
-        self._name_edit.setPlaceholderText("Script name…")
+        self._name_edit.setPlaceholderText("Untitled script")
+        self._name_edit.setFixedWidth(180)
         self._name_edit.setStyleSheet(
-            f"background: {self._INPUT_BG}; border: 1px solid {self._BORDER};"
-            f"color: {self._TEXT}; border-radius: 4px; padding: 0 6px; font-size: 12px;"
+            "QLineEdit { background: #1a1a1a; color: #e5e7eb; border: 1px solid #3a3a3a;"
+            " border-radius: 4px; padding: 0 8px; height: 26px; font-size: 12px; }"
         )
-        root.addWidget(self._name_edit)
 
-        # Hotkey field
-        hotkey_lbl = QLabel("Hotkey:")
-        hotkey_lbl.setStyleSheet(_sep_style)
-        root.addWidget(hotkey_lbl)
-        hk_row = QHBoxLayout()
-        hk_row.setSpacing(4)
-        self._hotkey_edit = QLineEdit()
-        self._hotkey_edit.setFixedHeight(26)
-        self._hotkey_edit.setReadOnly(True)
-        self._hotkey_edit.setPlaceholderText("None")
-        self._hotkey_edit.setStyleSheet(
-            f"background: {self._INPUT_BG}; border: 1px solid {self._BORDER};"
-            f"color: {self._TEXT}; border-radius: 4px; padding: 0 6px; font-size: 12px;"
-        )
-        self._rec_btn = QPushButton("Rec")
-        self._rec_btn.setFixedHeight(26)
-        self._rec_btn.setStyleSheet(self._btn_style())
-        self._rec_btn.clicked.connect(self._start_hotkey_capture)
-        hk_row.addWidget(self._hotkey_edit)
-        hk_row.addWidget(self._rec_btn)
-        root.addLayout(hk_row)
-
-        # Record / Save buttons
-        action_row = QHBoxLayout()
-        action_row.setSpacing(6)
-        self._record_btn = QPushButton("⏺ Record")
-        self._record_btn.setFixedHeight(26)
-        self._record_btn.setStyleSheet(self._btn_style())
-        self._record_btn.clicked.connect(self._toggle_record)
-        self._save_btn = QPushButton("💾 Save")
-        self._save_btn.setFixedHeight(26)
+        self._save_btn = QPushButton("Save")
+        self._save_btn.setFixedSize(60, 26)
         self._save_btn.setStyleSheet(
-            f"QPushButton {{ background: {self._ACCENT}; color: white; border: none;"
-            "  border-radius: 4px; font-size: 12px; height: 26px; }}"
-            f"QPushButton:hover {{ background: #4f46e5; }}"
+            "QPushButton { background: #6366f1; color: white; border: none;"
+            " border-radius: 4px; font-size: 12px; }"
+            "QPushButton:hover { background: #4f46e5; }"
         )
-        self._save_btn.clicked.connect(self._save_chain)
-        action_row.addWidget(self._record_btn)
-        action_row.addWidget(self._save_btn)
-        root.addLayout(action_row)
+        self._save_btn.clicked.connect(self._on_save)
 
-        self.adjustSize()
+        self._feedback = QLabel("")
+        self._feedback.setStyleSheet("color: #22c55e; font-size: 12px;")
+        self._feedback.hide()
 
-    def _btn_style(self) -> str:
-        return (
-            f"QPushButton {{ background: #1e1e1e; color: {self._TEXT}; border: 1px solid {self._BORDER};"
-            "  border-radius: 4px; font-size: 12px; height: 26px; padding: 0 8px; }}"
-            "QPushButton:hover { background: #2a2a2a; }"
-        )
+        layout.addWidget(lbl)
+        layout.addWidget(self._name_edit)
+        layout.addWidget(self._save_btn)
+        layout.addWidget(self._feedback)
+        layout.addStretch()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._feedback.hide)
 
-    def refresh_dots(self, dots: list[ClickDot]) -> None:
-        """Repopulate the available-dots chip row."""
-        self._dots = list(dots)
-        # Clear existing chips (leave stretch at end)
-        while self._chip_layout.count() > 1:
-            item = self._chip_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        for dot in self._dots:
-            chip = QPushButton(dot.label)
-            chip.setFixedHeight(24)
-            chip.setStyleSheet(
-                f"QPushButton {{ background: #1e1e1e; color: {self._TEXT};"
-                f"  border: 1px solid {self._BORDER}; border-radius: 4px;"
-                "  font-size: 11px; padding: 0 8px; }}"
-                "QPushButton:hover { background: #2a2a2a; }"
-            )
-            # Capture dot by value via default arg
-            chip.clicked.connect(lambda _checked, d=dot: self._append_step(d))
-            self._chip_layout.insertWidget(self._chip_layout.count() - 1, chip)
+    def _on_save(self):
+        name = self._name_edit.text().strip() or "Untitled script"
+        self.save_requested.emit(name)
 
-    def add_recorded_steps(self, steps: list[tuple[str, float]]) -> None:
-        """Append recorded steps: list of (dot_label, delay_before_seconds)."""
-        label_to_dot = {d.label: d for d in self._dots}
-        for label, delay in steps:
-            dot = label_to_dot.get(label)
-            if dot is not None:
-                self._append_step(dot, delay)
+    def show_feedback(self, msg: str = "Saved!") -> None:
+        self._feedback.setText(msg)
+        self._feedback.show()
+        self._hide_timer.start(2000)
 
-    # ------------------------------------------------------------------
-    # Sequence helpers
-    # ------------------------------------------------------------------
-
-    def _append_step(self, dot: ClickDot, delay: float = 0.5) -> None:
-        self._steps.append((dot, delay))
-        item = QListWidgetItem(f"{dot.label}  →  {delay:.1f}s")
-        self._seq_list.addItem(item)
-
-    def _edit_step_delay(self, item: QListWidgetItem) -> None:
-        row = self._seq_list.row(item)
-        if row < 0 or row >= len(self._steps):
-            return
-        dot, current_delay = self._steps[row]
-        new_delay, ok = QInputDialog.getDouble(
-            self, "Edit delay", f"Delay before '{dot.label}' (seconds):",
-            value=current_delay, min=0.0, max=60.0, decimals=2,
-        )
-        if ok:
-            self._steps[row] = (dot, new_delay)
-            item.setText(f"{dot.label}  →  {new_delay:.1f}s")
-
-    def _move_up(self) -> None:
-        row = self._seq_list.currentRow()
-        if row <= 0:
-            return
-        self._steps[row - 1], self._steps[row] = self._steps[row], self._steps[row - 1]
-        self._refresh_list(row - 1)
-
-    def _move_down(self) -> None:
-        row = self._seq_list.currentRow()
-        if row < 0 or row >= len(self._steps) - 1:
-            return
-        self._steps[row], self._steps[row + 1] = self._steps[row + 1], self._steps[row]
-        self._refresh_list(row + 1)
-
-    def _remove_step(self) -> None:
-        row = self._seq_list.currentRow()
-        if row < 0 or row >= len(self._steps):
-            return
-        self._steps.pop(row)
-        self._seq_list.takeItem(row)
-
-    def _refresh_list(self, select_row: int) -> None:
-        self._seq_list.clear()
-        for dot, delay in self._steps:
-            self._seq_list.addItem(f"{dot.label}  →  {delay:.1f}s")
-        self._seq_list.setCurrentRow(select_row)
-
-    # ------------------------------------------------------------------
-    # Hotkey capture
-    # ------------------------------------------------------------------
-
-    def _start_hotkey_capture(self) -> None:
-        self._rec_btn.setEnabled(False)
-        self._hotkey_edit.setPlaceholderText("Press combo…")
-        self._capture_worker = _HotkeyCapture(parent=self)
-        self._capture_worker.captured.connect(self._on_hotkey_captured)
-        self._capture_worker.start()
-
-    def _on_hotkey_captured(self, combo: str) -> None:
-        self._hotkey_edit.setText(combo)
-        self._rec_btn.setEnabled(True)
-        self._hotkey_edit.setPlaceholderText("None")
-
-    # ------------------------------------------------------------------
-    # Record clicks
-    # ------------------------------------------------------------------
-
-    def _toggle_record(self) -> None:
-        if self._recorder is not None and self._recorder.isRunning():
-            self._recorder.stop()
-            self._recorder.wait()
-            self._recorder = None
-            self._record_btn.setText("⏺ Record")
-        else:
-            self._recorder = _ClickRecorderThread(self._dots, parent=self)
-            self._recorder.recorded.connect(self._on_recorded)
-            self._recorder.start()
-            self._record_btn.setText("⏹ Stop")
-
-    def _on_recorded(self, steps: list[tuple[str, float]]) -> None:
-        self._record_btn.setText("⏺ Record")
-        self._recorder = None
-        self.add_recorded_steps(steps)
-
-    # ------------------------------------------------------------------
-    # Save
-    # ------------------------------------------------------------------
-
-    def _save_chain(self) -> None:
-        name = self._name_edit.text().strip() or "Unnamed"
-        chain = ClickChain.new(name, "_overlay")
-        chain.hotkey = self._hotkey_edit.text().strip()
-        for dot, delay in self._steps:
-            chain.steps.append(ChainStep(dot_id=dot.id, delay_before=delay))
-        store = get_click_store()
-        existing = store.load_chains(self._target_key, "_overlay")
-        # Upsert by id
-        updated = [c for c in existing if c.id != chain.id]
-        updated.append(chain)
-        store.save_chains(self._target_key, "_overlay", updated)
-        self.chain_saved.emit(chain)
+    def name(self) -> str:
+        return self._name_edit.text().strip() or "Untitled script"
 
 
 # ---------------------------------------------------------------------------
@@ -546,11 +176,12 @@ class RegionMapperOverlay(QWidget):
         geom = QGuiApplication.primaryScreen().geometry()
         self.setGeometry(geom)
 
-        self._build_ui()
+        # Connection editor state
+        self._connections: list[tuple[str, str, float]] = []  # (from_dot_id, to_dot_id, delay_s)
+        self._connecting_from: Optional[ClickDot] = None       # dot being dragged from
+        self._connect_to_pos: QPoint = QPoint()                # current drag end position
 
-        self._script_panel = _DotScriptPanel(target_key, parent=self)
-        self._script_panel.hide()
-        self._script_panel.chain_saved.connect(self._on_chain_saved)
+        self._build_ui()
 
     # ------------------------------------------------------------------
     # UI setup
@@ -591,6 +222,10 @@ class RegionMapperOverlay(QWidget):
         self._toolbar.move(
             (self.width() - self._toolbar.width()) // 2, 12
         )
+
+        self._script_name_bar = _ScriptNameBar(self)
+        self._script_name_bar.hide()
+        self._script_name_bar.save_requested.connect(self._on_save_script)
 
         # Instruction banner (below toolbar)
         self._banner = QLabel(
@@ -692,6 +327,52 @@ class RegionMapperOverlay(QWidget):
             painter.setPen(QPen(QColor("white")))
             painter.drawText(cx + 12, cy + 4, dot.label)
 
+        # Connections — draw arrows between dots
+        dot_map = {d.id: d for d in self._dots}
+        conn_font = QFont()
+        conn_font.setPointSize(9)
+        painter.setFont(conn_font)
+
+        for i, (from_id, to_id, delay) in enumerate(self._connections):
+            fd = dot_map.get(from_id)
+            td = dot_map.get(to_id)
+            if fd is None or td is None:
+                continue
+            fx, fy = int(fd.rx), int(fd.ry)
+            tx, ty = int(td.rx), int(td.ry)
+            # Draw line
+            painter.setPen(QPen(QColor("#6366f1"), 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawLine(fx, fy, tx, ty)
+            # Arrowhead at target end
+            angle = math.atan2(ty - fy, tx - fx)
+            arrow_len = 10
+            arrow_angle = 0.4
+            ax1 = tx - arrow_len * math.cos(angle - arrow_angle)
+            ay1 = ty - arrow_len * math.sin(angle - arrow_angle)
+            ax2 = tx - arrow_len * math.cos(angle + arrow_angle)
+            ay2 = ty - arrow_len * math.sin(angle + arrow_angle)
+            painter.drawLine(tx, ty, int(ax1), int(ay1))
+            painter.drawLine(tx, ty, int(ax2), int(ay2))
+            # Delay badge at midpoint
+            mx, my = (fx + tx) // 2, (fy + ty) // 2
+            badge_text = f"{delay:.1f}s"
+            badge_rect = QRect(mx - 20, my - 10, 40, 20)
+            badge_bg = QColor(30, 30, 50, 200)
+            painter.setBrush(QBrush(badge_bg))
+            painter.setPen(QPen(QColor("#6366f1"), 1))
+            painter.drawRoundedRect(badge_rect, 4, 4)
+            painter.setPen(QPen(QColor("#e5e7eb")))
+            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        # In-progress connection rubber-band
+        if self._connecting_from is not None:
+            fx = int(self._connecting_from.rx)
+            fy = int(self._connecting_from.ry)
+            painter.setPen(QPen(QColor("#a5b4fc"), 2, Qt.PenStyle.DashLine))
+            painter.drawLine(fx, fy, self._connect_to_pos.x(), self._connect_to_pos.y())
+
         painter.end()
 
     # ------------------------------------------------------------------
@@ -702,10 +383,17 @@ class RegionMapperOverlay(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             if self._tool == "dot":
                 pos = event.pos()
-                label = f"Dot {len(self._dots) + 1}"
-                self._dots.append(ClickDot.new(label, float(pos.x()), float(pos.y())))
-                self._script_panel.refresh_dots(self._dots)
-                self.update()
+                # If clicking on an existing dot → start connecting
+                hit_dot = self._dot_at(pos)
+                if hit_dot is not None:
+                    self._connecting_from = hit_dot
+                    self._connect_to_pos = pos
+                else:
+                    # Place new dot
+                    label = f"Dot {len(self._dots) + 1}"
+                    new_dot = ClickDot.new(label, float(pos.x()), float(pos.y()))
+                    self._dots.append(new_dot)
+                    self.update()
             else:
                 hit = self._region_at(event.pos())
                 if hit is None:
@@ -714,27 +402,41 @@ class RegionMapperOverlay(QWidget):
                     self._current_rect = QRect(self._start, self._start)
                     self.update()
         elif event.button() == Qt.MouseButton.RightButton:
-            dot_hit = self._dot_at(event.pos())
-            if dot_hit is not None:
-                self._show_dot_context_menu(event.globalPosition().toPoint(), dot_hit)
+            conn_idx = self._connection_at(event.pos())
+            if conn_idx >= 0:
+                self._show_connection_menu(event.globalPosition().toPoint(), conn_idx)
             else:
-                hit = self._region_at(event.pos())
-                if hit is not None:
-                    self._show_context_menu(event.globalPosition().toPoint(), hit)
+                dot_hit = self._dot_at(event.pos())
+                if dot_hit is not None:
+                    self._show_dot_context_menu(event.globalPosition().toPoint(), dot_hit)
+                else:
+                    hit = self._region_at(event.pos())
+                    if hit is not None:
+                        self._show_context_menu(event.globalPosition().toPoint(), hit)
 
     def mouseMoveEvent(self, event) -> None:
         if self._drawing:
             self._current_rect = QRect(self._start, event.pos()).normalized()
             self.update()
+        elif self._connecting_from is not None:
+            self._connect_to_pos = event.pos()
+            self.update()
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self._drawing:
-            self._drawing = False
-            rect = QRect(self._start, event.pos()).normalized()
-            if rect.width() > 10 and rect.height() > 10:
-                self._prompt_name_and_add(rect)
-            self._current_rect = None
-            self.update()
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._drawing:
+                self._drawing = False
+                rect = QRect(self._start, event.pos()).normalized()
+                if rect.width() > 10 and rect.height() > 10:
+                    self._prompt_name_and_add(rect)
+                self._current_rect = None
+                self.update()
+            elif self._connecting_from is not None:
+                target_dot = self._dot_at(event.pos())
+                if target_dot is not None and target_dot.id != self._connecting_from.id:
+                    self._connections.append((self._connecting_from.id, target_dot.id, 0.5))
+                self._connecting_from = None
+                self.update()
 
     # ------------------------------------------------------------------
     # Keyboard
@@ -777,27 +479,23 @@ class RegionMapperOverlay(QWidget):
             self._toolbar.y() + self._toolbar.height() + 6,
         )
         if tool == "dot":
-            self._script_panel.show()
-            self._position_script_panel()
-            self._script_panel.refresh_dots(self._dots)
+            self._script_name_bar.show()
+            self._position_name_bar()
         else:
-            self._script_panel.hide()
+            self._script_name_bar.hide()
 
-    def _position_script_panel(self) -> None:
-        """Pin the script panel to the right side, vertically centered."""
-        sw = self._script_panel.sizeHint().width() or 290
-        sh = self._script_panel.sizeHint().height() or 480
-        x = self.width() - sw - 20
-        y = (self.height() - sh) // 2
-        self._script_panel.setGeometry(x, y, sw, sh)
+    def _position_name_bar(self) -> None:
+        w = max(self._script_name_bar.sizeHint().width(), 420)
+        self._script_name_bar.setFixedWidth(w)
+        self._script_name_bar.adjustSize()
+        x = (self.width() - w) // 2
+        y = self._toolbar.y() + self._toolbar.height() + self._banner.height() + 10
+        self._script_name_bar.move(x, y)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self._script_panel.isVisible():
-            self._position_script_panel()
-
-    def _on_chain_saved(self, chain: ClickChain) -> None:
-        pass  # chain is already saved by _DotScriptPanel; overlay just acknowledges
+        if self._script_name_bar.isVisible():
+            self._position_name_bar()
 
     def _dot_at(self, pos: QPoint) -> Optional[ClickDot]:
         for dot in self._dots:
@@ -820,6 +518,77 @@ class RegionMapperOverlay(QWidget):
         elif chosen == delete_action:
             self._dots.remove(dot)
             self.update()
+
+    def _connection_at(self, pos: QPoint) -> int:
+        """Return index of connection whose midpoint delay badge is near pos, or -1."""
+        dot_map = {d.id: d for d in self._dots}
+        for i, (from_id, to_id, _delay) in enumerate(self._connections):
+            fd = dot_map.get(from_id)
+            td = dot_map.get(to_id)
+            if fd is None or td is None:
+                continue
+            mx = (int(fd.rx) + int(td.rx)) // 2
+            my = (int(fd.ry) + int(td.ry)) // 2
+            if abs(pos.x() - mx) < 24 and abs(pos.y() - my) < 14:
+                return i
+        return -1
+
+    def _show_connection_menu(self, global_pos: QPoint, idx: int) -> None:
+        menu = QMenu(self)
+        edit_action = menu.addAction("Edit delay")
+        delete_action = menu.addAction("Delete connection")
+        chosen = menu.exec(global_pos)
+        if chosen == edit_action:
+            current_delay = self._connections[idx][2]
+            new_delay, ok = QInputDialog.getDouble(
+                self, "Edit delay", "Seconds to wait before this click:",
+                value=current_delay, min=0.0, max=60.0, decimals=1,
+            )
+            if ok:
+                from_id, to_id, _ = self._connections[idx]
+                self._connections[idx] = (from_id, to_id, new_delay)
+                self.update()
+        elif chosen == delete_action:
+            self._connections.pop(idx)
+            self.update()
+
+    def _on_save_script(self, name: str) -> None:
+        if not self._dots or not self._connections:
+            return
+        # Build ordered steps from connections (chain: follow from first dot)
+        dot_map = {d.id: d for d in self._dots}
+        # Find start: dot that is never a "to" in any connection
+        to_ids = {c[1] for c in self._connections}
+        starts = [d for d in self._dots if d.id not in to_ids]
+        start_id = starts[0].id if starts else self._connections[0][0]
+        # Walk the chain
+        conn_map: dict[str, tuple[str, float]] = {c[0]: (c[1], c[2]) for c in self._connections}
+        steps = []
+        visited: set[str] = set()
+        cur = start_id
+        first = True
+        while cur and cur not in visited:
+            visited.add(cur)
+            nxt = conn_map.get(cur)
+            delay = 0.0 if first else (
+                next((c[2] for c in self._connections if c[1] == cur), 0.0)
+            )
+            steps.append(ChainStep(dot_id=cur, delay_before=delay))
+            first = False
+            cur = nxt[0] if nxt else None
+
+        chain = ClickChain.new(name, "_overlay")
+        chain.steps = steps
+
+        store = get_click_store()
+        existing = store.load_chains(self._target_key, "_overlay")
+        # Upsert by name
+        existing = [c for c in existing if c.name != name]
+        existing.append(chain)
+        store.save_chains(self._target_key, "_overlay", existing)
+        store.save_dots(self._target_key, "_overlay", list(self._dots))
+
+        self._script_name_bar.show_feedback("Saved!")
 
     def _region_at(self, pos: QPoint) -> Optional[Region]:
         for region in self._regions:
