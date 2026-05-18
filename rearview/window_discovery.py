@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class WindowTarget:
     id: str                        # unique stable identifier
-    type: str                      # "browser_tab" | "x11_app" | "headless"
+    type: str                      # "browser_tab" | "browser_window" | "x11_app" | "headless"
     display_name: str              # shown to user e.g. "Chrome — Aloware"
     app_name: str                  # "Chrome", "VS Code", "Terminal", etc.
     window_id: Optional[int]       # X11 window ID (xdotool wid)
@@ -28,6 +28,8 @@ class WindowTarget:
     tab_id: Optional[str]          # CDP target ID if browser_tab
     pid: Optional[int]             # process PID
     icon: str = ""                 # emoji icon for display: 🌐 browser, 🖥 app
+    parent_id: Optional[str] = None  # id of parent browser_window (for tabs)
+    depth: int = 0                   # 0 = top-level, 1 = child (tab under browser)
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +41,33 @@ _SYSTEM_WINDOW_NAMES: frozenset[str] = frozenset(
 )
 
 _CDP_PORTS = range(9222, 9231)
+
+_BROWSER_COMMS: frozenset[str] = frozenset({
+    "chrome", "google-chrome", "google-chrome-", "chromium", "chromium-browse",
+    "brave", "brave-browser", "firefox", "firefox-esr", "opera", "vivaldi",
+    "msedge", "microsoft-edge",
+})
+
+
+def _is_browser_process(comm: str) -> bool:
+    c = comm.lower()
+    return any(c.startswith(b) for b in _BROWSER_COMMS)
+
+
+def _get_pid_from_port(port: int) -> Optional[int]:
+    """Use ss to find the PID listening on port."""
+    try:
+        out = subprocess.run(
+            ["ss", "-tlnp", f"sport = :{port}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        import re
+        m = re.search(r"pid=(\d+)", out.stdout)
+        if m:
+            return int(m.group(1))
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return None
 
 
 def _read_proc_comm(pid: int) -> Optional[str]:
@@ -202,6 +231,7 @@ async def discover_browser_tabs() -> list[WindowTarget]:
             continue
 
         browser_name = _browser_name_from_version(version_data)
+        browser_pid = _get_pid_from_port(port)
 
         for tab in tabs_data:
             if not isinstance(tab, dict):
@@ -213,10 +243,6 @@ async def discover_browser_tabs() -> list[WindowTarget]:
             tab_title: str = tab.get("title", "")
             tab_url: str = tab.get("url", "")
 
-            wid: Optional[int] = None
-
-            # Derive a short URL label for display
-            url_label = _short_url(tab_url)
             display_name = f"{browser_name} — {tab_title}" if tab_title else browser_name
 
             targets.append(
@@ -225,12 +251,12 @@ async def discover_browser_tabs() -> list[WindowTarget]:
                     type="browser_tab",
                     display_name=display_name,
                     app_name=browser_name,
-                    window_id=wid,
+                    window_id=None,
                     cdp_url=base_url,
                     tab_url=tab_url or None,
                     tab_title=tab_title or None,
                     tab_id=tab_id or None,
-                    pid=None,
+                    pid=browser_pid,
                     icon="\U0001f310",  # 🌐
                 )
             )
@@ -296,6 +322,10 @@ def discover_x11_windows(browser_pids: Optional[set[int]] = None) -> list[Window
 
         app_name = _app_name_from_pid(pid, name)
 
+        # Detect browser processes for special handling
+        comm = _read_proc_comm(pid) if pid is not None else None
+        is_browser = comm is not None and _is_browser_process(comm)
+
         if name.lower().startswith(app_name.lower()):
             doc_part = name[len(app_name):].lstrip(" —-").strip()
             display_name = f"{app_name} — {doc_part}" if doc_part else app_name
@@ -311,7 +341,7 @@ def discover_x11_windows(browser_pids: Optional[set[int]] = None) -> list[Window
         targets.append(
             WindowTarget(
                 id=f"x11_{wid}",
-                type="x11_app",
+                type="browser_window" if is_browser else "x11_app",
                 display_name=display_name,
                 app_name=app_name,
                 window_id=wid,
@@ -320,7 +350,7 @@ def discover_x11_windows(browser_pids: Optional[set[int]] = None) -> list[Window
                 tab_title=None,
                 tab_id=None,
                 pid=pid,
-                icon="\U0001f5a5️",  # 🖥️
+                icon="\U0001f310" if is_browser else "\U0001f5a5️",  # 🌐 or 🖥️
             )
         )
 
@@ -345,25 +375,68 @@ def discover_headless_option() -> WindowTarget:
 
 
 async def discover_all() -> list[WindowTarget]:
-    """Discover all window targets: browser tabs, X11 apps, headless option.
+    """Discover all window targets with hierarchical browser grouping.
 
-    Returns targets in order:
-      1. Browser tabs (most useful first)
-      2. X11 applications
-      3. Headless option (always last)
+    Returns a flat ordered list:
+      1. For each browser window: the window entry, then its CDP tabs indented (depth=1)
+      2. Browser windows without CDP tabs still appear (no sub-items)
+      3. Non-browser X11 applications
+      4. Headless option (always last)
     """
     browser_tabs = await discover_browser_tabs()
 
-    # Collect PIDs from browser CDP results so x11 discovery can skip them
-    browser_pids: set[int] = set()
+    # Build PID→tabs map for attaching tabs to their browser window
+    pid_to_tabs: dict[int, list[WindowTarget]] = {}
     for tab in browser_tabs:
         if tab.pid is not None:
-            browser_pids.add(tab.pid)
+            pid_to_tabs.setdefault(tab.pid, []).append(tab)
 
-    x11_windows = discover_x11_windows(browser_pids=browser_pids)
-    headless = discover_headless_option()
+    # Collect browser PIDs that have CDP tabs (to avoid duplicating them in x11 list)
+    cdp_browser_pids: set[int] = {t.pid for t in browser_tabs if t.pid is not None}
 
-    return [*browser_tabs, *x11_windows, headless]
+    # Discover all X11 windows — browser windows ARE included (not filtered out)
+    x11_windows = discover_x11_windows(browser_pids=set())
+
+    result: list[WindowTarget] = []
+
+    # Separate browser windows from regular apps
+    browser_windows = [w for w in x11_windows if w.type == "browser_window"]
+    app_windows = [w for w in x11_windows if w.type != "browser_window"]
+
+    # Track which tabs have been assigned to a window
+    assigned_tab_ids: set[str] = set()
+
+    for bw in browser_windows:
+        result.append(bw)
+        tabs = pid_to_tabs.get(bw.pid or -1, [])
+        for tab in tabs:
+            child = WindowTarget(
+                id=tab.id,
+                type="browser_tab",
+                display_name=tab.display_name,
+                app_name=tab.app_name,
+                window_id=bw.window_id,  # inherit parent's wid for fallback
+                cdp_url=tab.cdp_url,
+                tab_url=tab.tab_url,
+                tab_title=tab.tab_title,
+                tab_id=tab.tab_id,
+                pid=tab.pid,
+                icon="  \U0001f5d2",  # 🗒 indented
+                parent_id=bw.id,
+                depth=1,
+            )
+            result.append(child)
+            assigned_tab_ids.add(tab.id)
+
+    # Tabs with no matching browser window (e.g. headless CDP) — append flat
+    for tab in browser_tabs:
+        if tab.id not in assigned_tab_ids:
+            result.append(tab)
+
+    result.extend(app_windows)
+    result.append(discover_headless_option())
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -375,18 +448,24 @@ def format_target_list(targets: list[WindowTarget]) -> str:
     lines: list[str] = []
     counter = 1
 
-    browser_targets = [t for t in targets if t.type == "browser_tab"]
+    browser_types = {"browser_window", "browser_tab"}
+    browser_targets = [t for t in targets if t.type in browser_types]
     app_targets = [t for t in targets if t.type == "x11_app"]
     headless_targets = [t for t in targets if t.type == "headless"]
 
     if browser_targets:
         lines.append("[bold cyan]BROWSERS[/bold cyan]")
         for t in browser_targets:
-            url_label = _short_url(t.tab_url or "")
-            if url_label:
-                entry = f"  [bold white][[{counter}]][/bold white] {t.icon} [green]{t.display_name}[/green] [dim]({url_label})[/dim]"
-            else:
+            if t.type == "browser_window":
                 entry = f"  [bold white][[{counter}]][/bold white] {t.icon} [green]{t.display_name}[/green]"
+            else:
+                # tab — indented
+                url_label = _short_url(t.tab_url or "")
+                title = t.tab_title or t.display_name
+                if url_label:
+                    entry = f"      [bold white][[{counter}]][/bold white] {t.icon} [cyan]{title}[/cyan] [dim]({url_label})[/dim]"
+                else:
+                    entry = f"      [bold white][[{counter}]][/bold white] {t.icon} [cyan]{title}[/cyan]"
             lines.append(entry)
             counter += 1
         lines.append("")

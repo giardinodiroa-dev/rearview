@@ -88,7 +88,7 @@ async def select_target_interactive(console: Console) -> WindowTarget:
 
         # Build an ordered list matching the displayed numbers (counter starts at 1)
         ordered = (
-            [t for t in targets if t.type == "browser_tab"]
+            [t for t in targets if t.type in ("browser_window", "browser_tab")]
             + [t for t in targets if t.type == "x11_app"]
             + [t for t in targets if t.type == "headless"]
         )
@@ -174,7 +174,7 @@ class TargetSession:
         self._listeners.append(fn)
 
     def is_browser(self) -> bool:
-        return self._current is not None and self._current.type in ("browser_tab", "headless")
+        return self._current is not None and self._current.type in ("browser_tab", "browser_window", "headless")
 
     def is_x11(self) -> bool:
         return self._current is not None and self._current.type == "x11_app"

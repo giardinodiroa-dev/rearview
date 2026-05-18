@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QDialogButtonBox, QPushButton,
 )
 from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QColor, QFont
 
 from rearview.window_discovery import WindowTarget
 
@@ -77,9 +77,7 @@ class TargetPickerDialog(QDialog):
         self._list.setSpacing(1)
 
         for t in self._targets:
-            item = QListWidgetItem(f"{t.icon}  {t.display_name}" if t.icon else t.display_name)
-            item.setData(Qt.ItemDataRole.UserRole, t)
-            self._list.addItem(item)
+            self._list.addItem(self._make_item(t))
 
         if self._list.count() > 0:
             self._list.setCurrentRow(0)
@@ -135,6 +133,19 @@ class TargetPickerDialog(QDialog):
             self._selected = item.data(Qt.ItemDataRole.UserRole)
             self.accept()
 
+    def _make_item(self, t: "WindowTarget") -> QListWidgetItem:
+        if t.depth > 0:
+            label = f"    {t.icon}  {t.tab_title or t.display_name}" if t.icon else f"    {t.tab_title or t.display_name}"
+        else:
+            label = f"{t.icon}  {t.display_name}" if t.icon else t.display_name
+        item = QListWidgetItem(label)
+        item.setData(Qt.ItemDataRole.UserRole, t)
+        if t.depth > 0:
+            item.setForeground(QColor("#93c5fd"))  # light blue for tabs
+        elif t.type == "browser_window":
+            item.setForeground(QColor("#34d399"))  # green for browser windows
+        return item
+
     def _on_refresh(self) -> None:
         import asyncio
         from rearview.window_discovery import discover_all
@@ -144,9 +155,7 @@ class TargetPickerDialog(QDialog):
 
         self._list.clear()
         for t in self._targets:
-            item = QListWidgetItem(f"{t.icon}  {t.display_name}" if t.icon else t.display_name)
-            item.setData(Qt.ItemDataRole.UserRole, t)
-            self._list.addItem(item)
+            self._list.addItem(self._make_item(t))
         if self._list.count() > 0:
             self._list.setCurrentRow(0)
 
