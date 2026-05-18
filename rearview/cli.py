@@ -349,6 +349,8 @@ def start(
 
         watcher = CallWatcher()
         hotkeys = HotkeyManager(loop)
+        from rearview.click_hotkeys import get_click_hotkey_manager
+        click_hotkeys = get_click_hotkey_manager(loop)
 
         async def _on_call_end(contact) -> None:
             if _toast_ref:
@@ -389,6 +391,7 @@ def start(
         hotkeys.set_disposition_callback(_on_disposition)
         hotkeys.set_next_callback(_on_next)
         hotkeys.start()
+        click_hotkeys.start()
 
         # Super+R: toggle macro recording
         recorder = None
@@ -450,6 +453,7 @@ def start(
             await watcher.watch()
         finally:
             hotkeys.stop()
+            click_hotkeys.stop()
             if '_record_hotkeys' in dir():
                 _record_hotkeys.stop()
             if speech is not None:
@@ -517,9 +521,13 @@ def start(
         qt_app = QApplication.instance() or QApplication(sys.argv)
 
         # Main management window
-        main_win = MainWindow()
+        main_win = MainWindow(loop=loop)
         _win_ref.append(main_win)
         main_win.set_status(True, target.display_name)
+
+        # Reload click hotkeys whenever chains are saved/deleted in the UI
+        from rearview.click_hotkeys import get_click_hotkey_manager as _get_chm
+        main_win.clicks_changed.connect(lambda: _get_chm(loop).reload())
 
         # Floating call overlay
         toast = ShadowToast()

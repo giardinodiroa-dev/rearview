@@ -20,6 +20,7 @@ from rearview.ui.macro_panel import MacroPanel
 from rearview.ui.script_panel import ScriptPanel
 from rearview.ui.settings_panel import SettingsPanel
 from rearview.ui.log_panel import LogPanel
+from rearview.ui.clicks_panel import ClicksPanel
 from rearview.ui.system_tray import RearviewTrayIcon
 
 
@@ -96,6 +97,7 @@ _NAV_ITEMS = [
     ("📄", "Script"),
     ("⚙", "Settings"),
     ("📋", "Logs"),
+    ("🖱", "Clicks"),
 ]
 
 
@@ -167,9 +169,11 @@ class MainWindow(QMainWindow):
     record_start_requested = pyqtSignal()
     record_stop_requested = pyqtSignal()
     switch_target_requested = pyqtSignal()
+    clicks_changed = pyqtSignal()   # re-emitted from ClicksPanel.chains_changed
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, loop=None) -> None:
         super().__init__(parent)
+        self._loop = loop
         self.setWindowTitle("Rearview")
         self.setMinimumSize(QSize(780, 560))
         self.resize(900, 640)
@@ -210,8 +214,9 @@ class MainWindow(QMainWindow):
         self._script = ScriptPanel()
         self._settings = SettingsPanel()
         self._log_panel = LogPanel()
+        self._clicks = ClicksPanel(loop=self._loop)
 
-        for panel in (self._dashboard, self._macros, self._script, self._settings, self._log_panel):
+        for panel in (self._dashboard, self._macros, self._script, self._settings, self._log_panel, self._clicks):
             self._stack.addWidget(panel)
 
     def _wire_signals(self) -> None:
@@ -230,6 +235,9 @@ class MainWindow(QMainWindow):
         # Settings saved → refresh script panel (script path may have changed)
         self._settings.settings_saved.connect(self._script.refresh)
         self._settings.settings_saved.connect(self._dashboard.refresh_hotkeys)
+
+        # Clicks panel → propagate chain changes to CLI for hotkey reload
+        self._clicks.chains_changed.connect(self.clicks_changed)
 
     def _wire_tray(self) -> None:
         self._tray.show_hide_requested.connect(self._toggle_visible)
@@ -312,6 +320,7 @@ class MainWindow(QMainWindow):
             "script": 2,
             "settings": 3,
             "logs": 4,
+            "clicks": 5,
         }
         idx = panel_map.get(name.lower())
         if idx is not None:
