@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QScrollArea, QFrame, QSizeGrip, QMenu, QSizePolicy, QLayout,
+    QStackedWidget, QLineEdit,
 )
-from PyQt6.QtCore import Qt, QPoint, QSize, QTimer, pyqtSignal, QMimeData
+from PyQt6.QtCore import Qt, QPoint, QSize, QTimer, pyqtSignal, QMimeData, QThread
 from PyQt6.QtGui import QGuiApplication, QPixmap, QDrag
+
+from rearview.click_store import ClickChain, get_click_store
 
 # ---------------------------------------------------------------------------
 # Style constants
@@ -88,6 +92,16 @@ _BTN_CLOSE = """
     }
     QPushButton:hover { background-color: #552222; color: #ff6666; }
 """
+
+_TAB_ACTIVE = (
+    "QPushButton { background: #6366f1; color: white; border: none; border-radius: 3px;"
+    " font-size: 11px; padding: 0 10px; height: 22px; }"
+)
+_TAB_INACTIVE = (
+    "QPushButton { background: #2a2a2a; color: #aaa; border: none; border-radius: 3px;"
+    " font-size: 11px; padding: 0 10px; height: 22px; }"
+    " QPushButton:hover { background: #3a3a3a; color: #ccc; }"
+)
 
 _SCROLLBAR_STYLE = f"""
     QScrollBar:vertical {{
@@ -458,6 +472,47 @@ class _RegionWidget(QFrame):
 
 
 # ---------------------------------------------------------------------------
+# _HotkeyCapture
+# ---------------------------------------------------------------------------
+
+class _HotkeyCapture(QThread):
+    captured = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._stop = threading.Event()
+
+    def run(self):
+        from pynput import keyboard as _kb
+        pressed: set[str] = set()
+        MOD_NAMES = {"ctrl", "alt", "shift", "cmd", "super"}
+
+        def on_press(key):
+            try:
+                name = key.name if hasattr(key, "name") else key.char
+            except Exception:
+                name = str(key)
+            if name:
+                pressed.add(name)
+
+        def on_release(key):
+            mods = [k for k in pressed if k in MOD_NAMES]
+            chars = [k for k in pressed if k not in MOD_NAMES]
+            if chars:
+                parts = [f"<{m}>" for m in sorted(mods)] + chars
+                self.captured.emit("".join(parts))
+                self._stop.set()
+
+        listener = _kb.Listener(on_press=on_press, on_release=on_release)
+        listener.start()
+        self._stop.wait(timeout=15)
+        listener.stop()
+
+    def stop(self):
+        self._stop.set()
+
+
+# ---------------------------------------------------------------------------
 # ViewerToast
 # ---------------------------------------------------------------------------
 
@@ -472,6 +527,7 @@ class ViewerToast(QWidget):
     region_remap_requested  = pyqtSignal(str)        # name
     region_reordered        = pyqtSignal(str, str)   # source_name, target_name
     region_click_requested  = pyqtSignal(str, float, float)  # name, rel_x, rel_y
+    run_chain_requested     = pyqtSignal(str)         # chain_id
 
     # Internal signals for thread-safe calls from background threads
     _sig_update  = pyqtSignal(object)   # list[tuple[str, QPixmap]]
@@ -487,6 +543,7 @@ class ViewerToast(QWidget):
         self._streamers: list = []
         self._card_dragging = False  # True while a card QDrag is in exec()
         self._layout_horizontal = False
+        self._scripts_target_key: str = ""
 
         self._setup_window()
         self._build_ui()
@@ -590,10 +647,14 @@ class ViewerToast(QWidget):
         self._footer_bar   = self._build_footer()
         self._mini_bar.hide()
 
+        self._content_stack = QStackedWidget()
+        self._content_stack.addWidget(self._build_content_area())   # index 0 = regions
+        self._content_stack.addWidget(self._build_scripts_panel())  # index 1 = scripts
+
         outer.addWidget(self._header_bar)
         outer.addWidget(self._status_bar)
         outer.addWidget(self._mini_bar)
-        outer.addWidget(self._build_content_area(), stretch=1)
+        outer.addWidget(self._content_stack, stretch=1)
         outer.addWidget(self._footer_bar)
 
         # Resize grip (must exist before resizeEvent fires)
@@ -624,6 +685,26 @@ class ViewerToast(QWidget):
         layout.addWidget(dot)
         layout.addWidget(self._target_label)
         layout.addStretch()
+
+        # Tab toggles
+        self._tab_regions_btn = QPushButton("Regions")
+        self._tab_regions_btn.setFixedHeight(22)
+        self._tab_regions_btn.setCheckable(True)
+        self._tab_regions_btn.setChecked(True)
+        self._tab_regions_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tab_regions_btn.setStyleSheet(_TAB_ACTIVE)
+        self._tab_regions_btn.clicked.connect(lambda: self._switch_tab("regions"))
+
+        self._tab_scripts_btn = QPushButton("Scripts")
+        self._tab_scripts_btn.setFixedHeight(22)
+        self._tab_scripts_btn.setCheckable(True)
+        self._tab_scripts_btn.setChecked(False)
+        self._tab_scripts_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tab_scripts_btn.setStyleSheet(_TAB_INACTIVE)
+        self._tab_scripts_btn.clicked.connect(lambda: self._switch_tab("scripts"))
+
+        layout.addWidget(self._tab_regions_btn)
+        layout.addWidget(self._tab_scripts_btn)
 
         # Map button
         self._map_btn = QPushButton("⬜ Map")
@@ -791,6 +872,172 @@ class ViewerToast(QWidget):
         layout.addWidget(self._pin_btn)
 
         return bar
+
+    def _build_scripts_panel(self) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setStyleSheet(
+            f"QScrollArea {{ background: {_BG}; border: none; }}"
+            + _SCROLLBAR_STYLE
+        )
+
+        container = QWidget()
+        container.setStyleSheet(f"background: {_BG};")
+        self._scripts_layout = QVBoxLayout(container)
+        self._scripts_layout.setContentsMargins(4, 4, 4, 4)
+        self._scripts_layout.setSpacing(4)
+        self._scripts_layout.addStretch()
+
+        self._scripts_list_widget = container
+        scroll.setWidget(container)
+        self._scripts_scroll = scroll
+        return scroll
+
+    def _switch_tab(self, tab: str) -> None:
+        if tab == "regions":
+            self._content_stack.setCurrentIndex(0)
+            self._tab_regions_btn.setStyleSheet(_TAB_ACTIVE)
+            self._tab_scripts_btn.setStyleSheet(_TAB_INACTIVE)
+        else:
+            self._content_stack.setCurrentIndex(1)
+            self._tab_regions_btn.setStyleSheet(_TAB_INACTIVE)
+            self._tab_scripts_btn.setStyleSheet(_TAB_ACTIVE)
+            self._reload_scripts()
+
+    def _reload_scripts(self) -> None:
+        # Clear existing rows (keep the trailing stretch at the end)
+        while self._scripts_layout.count() > 1:
+            item = self._scripts_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        chains = get_click_store().load_chains(self._scripts_target_key, "_overlay")
+
+        if not chains:
+            empty = QLabel(
+                "No scripts yet.\nOpen the mapping overlay,\nswitch to Dot mode, and save a script."
+            )
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setStyleSheet(f"color: {_TEXT_DIM}; font-size: 11px; padding: 20px;")
+            self._scripts_layout.insertWidget(0, empty)
+            return
+
+        for chain in chains:
+            row = self._build_chain_row(chain)
+            self._scripts_layout.insertWidget(self._scripts_layout.count() - 1, row)
+
+    def _build_chain_row(self, chain: ClickChain) -> QFrame:
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame {{ background: {_BG_HEADER}; border: 1px solid {_BORDER};"
+            " border-radius: 4px; margin: 2px 4px; }}"
+        )
+
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(4)
+
+        # Name row
+        name_lbl = QLabel(chain.name)
+        name_lbl.setStyleSheet(
+            f"color: {_ACCENT}; font-size: 11px; font-weight: bold;"
+            " background: transparent; border: none;"
+        )
+        outer.addWidget(name_lbl)
+
+        # Hotkey row
+        hotkey_row = QWidget()
+        hotkey_row.setStyleSheet("background: transparent;")
+        hk_layout = QHBoxLayout(hotkey_row)
+        hk_layout.setContentsMargins(0, 0, 0, 0)
+        hk_layout.setSpacing(4)
+
+        hk_lbl = QLabel("Hotkey:")
+        hk_lbl.setStyleSheet(f"color: {_TEXT}; font-size: 11px; background: transparent; border: none;")
+
+        hk_field = QLineEdit(chain.hotkey)
+        hk_field.setFixedHeight(20)
+        hk_field.setPlaceholderText("e.g. <ctrl>1")
+        hk_field.setStyleSheet(
+            f"QLineEdit {{ background: #222; color: {_TEXT}; border: 1px solid {_BORDER};"
+            " border-radius: 3px; font-size: 11px; padding: 0 4px; }}"
+        )
+
+        rec_btn = QPushButton("Rec")
+        rec_btn.setFixedHeight(20)
+        rec_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        rec_btn.setStyleSheet(_BTN_GRAY)
+
+        hk_layout.addWidget(hk_lbl)
+        hk_layout.addWidget(hk_field, stretch=1)
+        hk_layout.addWidget(rec_btn)
+        outer.addWidget(hotkey_row)
+
+        # Action row
+        action_row = QWidget()
+        action_row.setStyleSheet("background: transparent;")
+        act_layout = QHBoxLayout(action_row)
+        act_layout.setContentsMargins(0, 0, 0, 0)
+        act_layout.setSpacing(4)
+
+        run_btn = QPushButton("▶ Run")
+        run_btn.setFixedHeight(22)
+        run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        run_btn.setStyleSheet(_BTN_INDIGO)
+
+        del_btn = QPushButton("🗑")
+        del_btn.setFixedHeight(22)
+        del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        del_btn.setStyleSheet(_BTN_GRAY)
+
+        act_layout.addStretch()
+        act_layout.addWidget(run_btn)
+        act_layout.addWidget(del_btn)
+        outer.addWidget(action_row)
+
+        # Wire hotkey save on editingFinished
+        chain_id = chain.id
+        chain_region = chain.region_name
+
+        def _save_hotkey():
+            new_hk = hk_field.text().strip()
+            store = get_click_store()
+            chains_list = store.load_chains(self._scripts_target_key, chain_region)
+            for c in chains_list:
+                if c.id == chain_id:
+                    c.hotkey = new_hk
+                    break
+            store.save_chains(self._scripts_target_key, chain_region, chains_list)
+
+        hk_field.editingFinished.connect(_save_hotkey)
+
+        # Wire Rec button
+        self._hotkey_capture: _HotkeyCapture | None = None
+
+        def _start_rec():
+            cap = _HotkeyCapture()
+            cap.captured.connect(lambda combo: (hk_field.setText(combo), cap.stop()))
+            cap.start()
+            self._hotkey_capture = cap
+
+        rec_btn.clicked.connect(_start_rec)
+
+        # Wire Run button
+        run_btn.clicked.connect(lambda: self.run_chain_requested.emit(chain_id))
+
+        # Wire Delete button
+        def _delete_chain():
+            store = get_click_store()
+            chains_list = store.load_chains(self._scripts_target_key, chain_region)
+            chains_list = [c for c in chains_list if c.id != chain_id]
+            store.save_chains(self._scripts_target_key, chain_region, chains_list)
+            self._reload_scripts()
+
+        del_btn.clicked.connect(_delete_chain)
+
+        return frame
 
     def _on_layout_toggled(self, horizontal: bool) -> None:
         self._layout_horizontal = horizontal
@@ -1071,3 +1318,6 @@ class ViewerToast(QWidget):
     def set_target_name(self, name: str) -> None:
         self._target_label.setText(name)
         self._mini_label.setText(name)
+
+    def set_scripts_target(self, target_key: str) -> None:
+        self._scripts_target_key = target_key

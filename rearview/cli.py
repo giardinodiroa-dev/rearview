@@ -211,6 +211,7 @@ def start(
         tray_v.show()
 
         viewer = ViewerToast(target_name=target.display_name)
+        viewer.set_scripts_target(target_key)
         tray_v.show_hide_requested.connect(
             lambda: viewer.hide() if viewer.isVisible() else viewer.show()
         )
@@ -294,6 +295,21 @@ def start(
         viewer.region_remap_requested.connect(_on_region_remap_requested)
         viewer.region_reordered.connect(_on_region_reordered)
         viewer.region_click_requested.connect(_on_region_click)
+
+        def _on_run_chain(chain_id: str) -> None:
+            from rearview.click_store import get_click_store as _gcs
+            from rearview.click_executor import get_click_executor
+            store_c = _gcs()
+            chains = store_c.load_chains(target_key, "_overlay")
+            chain = next((c for c in chains if c.id == chain_id), None)
+            if chain is None:
+                return
+            dots = store_c.dots_for_chain(target_key, chain)
+            asyncio.run_coroutine_threadsafe(
+                get_click_executor(loop_v).run_chain(chain, dots), loop_v
+            )
+
+        viewer.run_chain_requested.connect(_on_run_chain)
 
         if not _regions:
             QTimer.singleShot(500, _on_map_requested)
