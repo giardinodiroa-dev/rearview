@@ -1,18 +1,10 @@
 import asyncio
 import logging
 
-from pynput.mouse import Controller as _MouseController, Button as _Button
-
 from rearview.click_store import ClickChain, ClickDot
+from rearview.controller import get_controller
 
 logger = logging.getLogger(__name__)
-
-_mouse = _MouseController()
-
-
-def _do_click(x: int, y: int) -> None:
-    _mouse.position = (x, y)
-    _mouse.click(_Button.left, 1)
 
 
 class ClickExecutor:
@@ -45,11 +37,7 @@ class ClickExecutor:
                     continue
                 abs_x = int(dot.rx)
                 abs_y = int(dot.ry)
-                # Move mouse and click at absolute screen coords in a thread
-                # so we don't block the event loop
-                await asyncio.get_event_loop().run_in_executor(
-                    None, _do_click, abs_x, abs_y
-                )
+                await get_controller().background_click(abs_x, abs_y)
                 logger.info(
                     "ClickExecutor: [%s] clicked %s at (%d,%d)",
                     chain.name,
