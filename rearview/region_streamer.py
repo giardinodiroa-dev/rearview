@@ -190,7 +190,7 @@ class RegionStreamer(QObject):
 
             while self._running:
                 try:
-                    png = await page.screenshot(clip=clip, type="jpeg", quality=80)
+                    png = await page.screenshot(clip=clip, type="png")
                     img = QImage.fromData(png)
                     if not img.isNull() and self._running:
                         self.frame_ready.emit(img.copy())

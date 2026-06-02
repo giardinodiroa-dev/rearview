@@ -71,6 +71,45 @@ def _open_in_editor(path: Path) -> None:
     subprocess.run([editor, str(path)])
 
 
+def _migrate_to_stable_key(new_key: str, app_name: str) -> None:
+    """One-time migration: copy configs from old display-name keys to the stable key."""
+    import json as _json
+    from rearview.region_mapper import RegionStore
+    from rearview.click_store import get_click_store
+
+    # Migrate regions
+    rs = RegionStore()
+    raw_regions = rs._load_all()
+    if not raw_regions.get(new_key):
+        old_rkey = next(
+            (k for k in raw_regions
+             if k != new_key and app_name.lower() in k.lower() and raw_regions[k]),
+            None,
+        )
+        if old_rkey:
+            rs.save(new_key, rs.load(old_rkey))
+
+    # Migrate dots + chains
+    dot_path = ROOT / "config" / "click_dots.json"
+    if not dot_path.exists():
+        return
+    raw_dots = _json.loads(dot_path.read_text())
+    new_dot_key = f"{new_key}::_overlay"
+    if not raw_dots.get(new_dot_key, {}).get("chains"):
+        old_dkey = next(
+            (k for k in raw_dots
+             if k != new_dot_key
+             and app_name.lower() in k.split("::")[0].lower()
+             and (raw_dots[k].get("dots") or raw_dots[k].get("chains"))),
+            None,
+        )
+        if old_dkey:
+            cs = get_click_store()
+            old_base = old_dkey.rsplit("::", 1)[0]
+            cs.save_dots(new_key, "_overlay", cs.load_dots(old_base, "_overlay"))
+            cs.save_chains(new_key, "_overlay", cs.load_chains(old_base, "_overlay"))
+
+
 # ---------------------------------------------------------------------------
 # start
 # ---------------------------------------------------------------------------
@@ -199,7 +238,19 @@ def start(
         qt_app_v = QApplication.instance() or QApplication(sys.argv)
         loop_v = asyncio.new_event_loop()
 
-        target_key = target.tab_url or target.display_name
+        # Stable key that persists across sessions (tab URLs and display names change)
+        if target.cdp_url and target.app_name:
+            _cdp_port = target.cdp_url.rsplit(":", 1)[-1].rstrip("/")
+            target_key = f"{target.app_name}:{_cdp_port}"
+        elif target.app_name:
+            target_key = target.app_name
+        else:
+            target_key = target.display_name
+
+        # Migrate any data saved under old display-name keys (one-time, non-destructive)
+        if target.app_name:
+            _migrate_to_stable_key(target_key, target.app_name)
+
         store_v = RegionStore()
         _regions: list = store_v.load(target_key)
         _viewer_target = target
@@ -209,6 +260,17 @@ def start(
         tray_v.set_target_name(target.display_name)
         tray_v.quit_requested.connect(qt_app_v.quit)
         tray_v.show()
+
+        _auto_reload_timer = QTimer()
+        _auto_reload_timer.setInterval(3000)  # 3 s between reloads
+
+        def _on_auto_reload_toggled(enabled: bool) -> None:
+            if enabled:
+                _auto_reload_timer.start()
+            else:
+                _auto_reload_timer.stop()
+
+        tray_v.auto_reload_toggled.connect(_on_auto_reload_toggled)
 
         viewer = ViewerToast(target_name=target.display_name)
         viewer.set_scripts_target(target_key)
@@ -227,24 +289,29 @@ def start(
         # Holds a strong Python reference to the overlay so GC doesn't destroy it
         _overlay_ref: list = []
 
-        # Map button → fullscreen overlay to draw/edit regions
+        def _on_regions_updated(new_regions: list) -> None:
+            _regions.clear()
+            _regions.extend(new_regions)
+            _overlay_ref.clear()
+            viewer.show()
+            viewer.raise_()
+            # 400ms for compositor to fully remove the overlay before streaming starts
+            QTimer.singleShot(400, lambda: viewer.start_streaming(_regions, target=_viewer_target))
+
+        # Map button → fullscreen overlay to draw/edit regions only (no dots — scripts are per-card)
         def _on_map_requested() -> None:
+            if _overlay_ref:
+                _overlay_ref[0].raise_()
+                return
+            from rearview.click_hotkeys import get_click_hotkey_manager as _get_chm
             _overlay_ref.clear()
             overlay = RegionMapperOverlay(target_key, existing_regions=list(_regions))
             _overlay_ref.append(overlay)
-
-            def _on_regions_updated(new_regions: list) -> None:
-                _regions.clear()
-                _regions.extend(new_regions)
-                _overlay_ref.clear()
-                viewer.show()
-                viewer.raise_()
-                # 400ms for compositor to fully remove the overlay before streaming starts
-                QTimer.singleShot(400, lambda: viewer.start_streaming(_regions, target=_viewer_target))
-
             overlay.regions_updated.connect(_on_regions_updated)
+            overlay.region_live_updated.connect(lambda regions: viewer.start_streaming(regions, target=_viewer_target))
             overlay.cancelled.connect(lambda: _overlay_ref.clear())
             overlay.script_saved.connect(lambda _key: viewer._reload_scripts())
+            overlay.script_saved.connect(lambda _key: _get_chm(loop_v).reload())
             overlay.show()
 
         viewer.map_requested.connect(_on_map_requested)
@@ -312,13 +379,67 @@ def start(
 
         viewer.run_chain_requested.connect(_on_run_chain)
 
+        def _on_script_edit(chain_id: str) -> None:
+            if _overlay_ref:
+                _overlay_ref[0].raise_()
+                return
+            from rearview.click_store import get_click_store as _gcs
+            from rearview.region_mapper import RegionMapperOverlay as _RMO
+            from rearview.click_hotkeys import get_click_hotkey_manager as _get_chm
+            store_c = _gcs()
+            chains = store_c.load_chains(target_key, "_overlay")
+            chain = next((c for c in chains if c.id == chain_id), None)
+            if chain is None:
+                return
+            chain_dot_ids = {step.dot_id for step in chain.steps}
+            all_dots = store_c.load_dots(target_key, "_overlay")
+            dots = [d for d in all_dots if d.id in chain_dot_ids]
+            # Rebuild connections from ordered steps: step[i] → step[i+1] with step[i+1].delay_before
+            connections: list[tuple[str, str, float]] = []
+            for i in range(len(chain.steps) - 1):
+                connections.append((
+                    chain.steps[i].dot_id,
+                    chain.steps[i + 1].dot_id,
+                    chain.steps[i + 1].delay_before,
+                ))
+            _overlay_ref.clear()
+            overlay = _RMO(
+                target_key,
+                existing_regions=list(_regions),
+                existing_dots=dots,
+                existing_connections=connections,
+                initial_tool="dot",
+                initial_script_name=chain.name,
+            )
+            _overlay_ref.append(overlay)
+            overlay.regions_updated.connect(_on_regions_updated)
+            overlay.region_live_updated.connect(lambda regions: viewer.start_streaming(regions, target=_viewer_target))
+            overlay.cancelled.connect(lambda: _overlay_ref.clear())
+            overlay.script_saved.connect(lambda _key: viewer._reload_scripts())
+            overlay.script_saved.connect(lambda _key: _get_chm(loop_v).reload())
+            overlay.show()
+
+        viewer.script_edit_requested.connect(_on_script_edit)
+
+        def _on_hotkey_saved() -> None:
+            from rearview.click_hotkeys import get_click_hotkey_manager as _get_chm
+            _get_chm(loop_v).reload()
+
+        viewer.hotkey_saved.connect(_on_hotkey_saved)
+
+        _auto_reload_timer.timeout.connect(
+            lambda: viewer.start_streaming(_regions, target=_viewer_target)
+        )
+
         if not _regions:
             QTimer.singleShot(500, _on_map_requested)
         else:
-            viewer.start_streaming(_regions, target=_viewer_target)
+            QTimer.singleShot(0, lambda: viewer.start_streaming(_regions, target=_viewer_target))
 
         def _viewer_thread() -> None:
             asyncio.set_event_loop(loop_v)
+            from rearview.click_hotkeys import get_click_hotkey_manager as _get_chm
+            threading.Thread(target=_get_chm(loop_v).start, daemon=True, name="chm-init").start()
             loop_v.run_until_complete(_viewer_main())
 
         threading.Thread(target=_viewer_thread, daemon=True, name="viewer-async").start()
@@ -356,6 +477,7 @@ def start(
     # Shared state between async thread and Qt thread
     _toast_ref: list = []       # populated once Qt thread creates the toast
     _win_ref: list = []         # populated once Qt thread creates the main window
+    _vm_toast_ref: list = []    # populated once Qt thread creates the voicemail toast
     _shared: dict = {}          # "on_disposition" key set by async thread
 
     async def _run_watcher() -> None:
@@ -368,6 +490,7 @@ def start(
         hotkeys = HotkeyManager(loop)
         from rearview.click_hotkeys import get_click_hotkey_manager
         click_hotkeys = get_click_hotkey_manager(loop)
+        vm_detector = None  # assigned later after speech listener starts
 
         async def _on_call_end(contact) -> None:
             if _toast_ref:
@@ -375,6 +498,9 @@ def start(
                 _toast_ref[0].set_disposition_mode(True)
                 _toast_ref[0].flash()
             hotkeys.set_disposition_mode(True)
+            # Re-arm voicemail detection for this new call
+            if vm_detector is not None:
+                vm_detector.reset()
 
         async def _on_disposition(label: str) -> None:
             hotkeys.set_disposition_mode(False)
@@ -447,12 +573,22 @@ def start(
 
         # Speech listener — feeds transcript chunks to the teleprompter
         speech = None
+        vm_detector = None
         if not no_speech and cfg.teleprompter.enabled:
             try:
                 from rearview.speech.listener import SpeechListener
+                from rearview.speech.voicemail_detector import VoicemailDetector
                 transcript_queue: asyncio.Queue = asyncio.Queue()
                 speech = SpeechListener(loop, transcript_queue)
+
+                async def _on_voicemail_detected() -> None:
+                    if _vm_toast_ref:
+                        _vm_toast_ref[0].show_voicemail()
+
+                vm_detector = VoicemailDetector(loop, _on_voicemail_detected)
+                speech.subscribe_audio(vm_detector.push_audio)
                 speech.start()
+                vm_detector.start()
 
                 async def _forward_transcript() -> None:
                     while True:
@@ -461,6 +597,8 @@ def start(
                             break
                         if _toast_ref:
                             _toast_ref[0].push_transcript(chunk)
+                        if vm_detector:
+                            vm_detector.push_transcript(chunk)
 
                 loop.create_task(_forward_transcript())
             except Exception as exc:
@@ -475,6 +613,8 @@ def start(
                 _record_hotkeys.stop()
             if speech is not None:
                 speech.stop()
+            if vm_detector is not None:
+                vm_detector.stop()
 
     async def _main_loop() -> None:
         nonlocal watcher_task
@@ -549,6 +689,25 @@ def start(
         # Floating call overlay
         toast = ShadowToast()
         _toast_ref.append(toast)
+
+        # Voicemail detection popup
+        from rearview.toast.voicemail_toast import VoicemailToast
+        vm_toast = VoicemailToast(loop=loop, macros_dir=ROOT / "macros")
+        _vm_toast_ref.append(vm_toast)
+
+        def _on_run_macro_from_vm(name: str) -> None:
+            from rearview.macro_store import load_macro
+            from rearview.controller import get_controller
+            try:
+                macro = load_macro(name)
+            except FileNotFoundError:
+                return
+            asyncio.run_coroutine_threadsafe(
+                get_controller().play_macro(macro),
+                loop,
+            )
+
+        vm_toast.run_macro_requested.connect(_on_run_macro_from_vm)
 
         # Load teleprompter script
         script_path = ROOT / cfg.teleprompter.script

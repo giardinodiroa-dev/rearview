@@ -6,10 +6,10 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QScrollArea, QFrame, QSizeGrip, QMenu, QSizePolicy, QLayout,
-    QStackedWidget, QLineEdit,
+    QStackedWidget, QLineEdit, QGridLayout,
 )
-from PyQt6.QtCore import Qt, QPoint, QSize, QTimer, pyqtSignal, QMimeData, QThread
-from PyQt6.QtGui import QGuiApplication, QPixmap, QDrag
+from PyQt6.QtCore import Qt, QPoint, QSize, QTimer, pyqtSignal, QThread, QObject, QEvent
+from PyQt6.QtGui import QGuiApplication, QPixmap, QPainter
 
 from rearview.click_store import ClickChain, get_click_store
 
@@ -127,13 +127,11 @@ _SCROLLBAR_STYLE = f"""
 # Drag-and-drop helpers
 # ---------------------------------------------------------------------------
 
-_REGION_MIME = "application/x-rearview-region"
-
 
 class _DragHandle(QLabel):
-    """Gripper that starts a QDrag when the user clicks and moves."""
+    """Gripper label — signals ViewerToast to start a managed drag once threshold crossed."""
 
-    drag_requested = pyqtSignal(str)  # region name
+    drag_start = pyqtSignal(str, QPoint)   # region_name, global_press_pos
 
     def __init__(self, region_name: str, parent=None):
         super().__init__("⠿", parent)
@@ -143,24 +141,28 @@ class _DragHandle(QLabel):
             "color: #555; font-size: 13px; padding: 0 3px; background: transparent;"
         )
         self._press_pos: QPoint | None = None
+        self._live = False
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._press_pos = event.pos()
+            self._press_pos = event.globalPosition().toPoint()
+            self._live = False
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if (
             self._press_pos is not None
+            and not self._live
             and event.buttons() & Qt.MouseButton.LeftButton
-            and (event.pos() - self._press_pos).manhattanLength() > 4
+            and (event.globalPosition().toPoint() - self._press_pos).manhattanLength() > 6
         ):
-            self.drag_requested.emit(self._region_name)
-            self._press_pos = None
+            self._live = True
+            self.drag_start.emit(self._region_name, self._press_pos)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         self._press_pos = None
+        self._live = False
         super().mouseReleaseEvent(event)
 
 
@@ -246,7 +248,6 @@ class _RegionWidget(QFrame):
             }}
         """)
 
-        self.setAcceptDrops(True)
         self.setMinimumSize(0, 0)
 
         layout = QVBoxLayout(self)
@@ -264,7 +265,7 @@ class _RegionWidget(QFrame):
 
         self._handle = _DragHandle(name, self)
         self._handle.setMinimumSize(0, 0)
-        self._handle.drag_requested.connect(self._start_drag)
+        self._handle.drag_start.connect(self._on_drag_start)
 
         self._name_label = QLabel(name)
         self._name_label.setMinimumWidth(0)
@@ -338,6 +339,7 @@ class _RegionWidget(QFrame):
         layout.addWidget(img_container)
 
         self._manual_height: int = 0
+        self._img_h: int = -1
         self._resize_handle = _ResizeHandle(self)
         self._resize_handle.height_delta.connect(self._on_resize_drag)
         self._resize_handle.reset.connect(self._on_resize_reset)
@@ -378,17 +380,24 @@ class _RegionWidget(QFrame):
     def _render_pixmap(self, smooth: bool = True):
         if self._pixmap.isNull():
             self._img_label.clear()
-            self._img_label.setMinimumHeight(0)
-            self._img_label.setMaximumHeight(0)
+            if self._img_h != 0:
+                self._img_h = 0
+                self._img_label.setMinimumHeight(0)
+                self._img_label.setMaximumHeight(0)
             return
         w = self._img_label.width()
+        if w <= 0:
+            return
         mode = (Qt.TransformationMode.SmoothTransformation if smooth
                 else Qt.TransformationMode.FastTransformation)
         scaled = self._pixmap.scaledToWidth(w, mode)
-        self._img_label.setMinimumHeight(0)
-        self._img_label.setMaximumHeight(16777215)
         self._img_label.setPixmap(scaled)
-        self._img_label.setFixedHeight(scaled.height())
+        new_h = scaled.height()
+        if new_h != self._img_h:
+            self._img_h = new_h
+            self._img_label.setMinimumHeight(0)
+            self._img_label.setMaximumHeight(16777215)
+            self._img_label.setFixedHeight(new_h)
 
     def update_pixmap(self, pixmap: QPixmap) -> None:
         self._pixmap = pixmap
@@ -400,7 +409,7 @@ class _RegionWidget(QFrame):
 
     def _on_stream_frame(self, img) -> None:
         self._pixmap = QPixmap.fromImage(img)
-        self._render_pixmap(smooth=False)
+        self._render_pixmap(smooth=True)
 
     def minimumSizeHint(self) -> QSize:
         return QSize(0, 0)
@@ -410,45 +419,26 @@ class _RegionWidget(QFrame):
         self._render_pixmap(smooth=False)
 
     # ------------------------------------------------------------------
-    # Drag source
+    # Drag (manual — no QDrag)
     # ------------------------------------------------------------------
 
-    def _start_drag(self, name: str) -> None:
-        # Walk up to ViewerToast and lock it so auto-refresh can't deleteLater us
+    def _on_drag_start(self, name: str, global_pos: QPoint) -> None:
         toast = self.parent()
         while toast is not None and not isinstance(toast, ViewerToast):
             toast = toast.parent()
         if toast is not None:
-            toast._card_dragging = True
-        try:
-            drag = QDrag(self)
-            mime = QMimeData()
-            mime.setData(_REGION_MIME, name.encode())
-            drag.setMimeData(mime)
-            drag.exec(Qt.DropAction.MoveAction)
-        finally:
-            if toast is not None:
-                toast._card_dragging = False
-                toast.drag_ended.emit()
+            toast._start_managed_drag(self, name, global_pos)
 
-    # ------------------------------------------------------------------
-    # Drop target
-    # ------------------------------------------------------------------
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasFormat(_REGION_MIME):
-            event.acceptProposedAction()
-
-    def dragMoveEvent(self, event):
-        if event.mimeData().hasFormat(_REGION_MIME):
-            event.acceptProposedAction()
-
-    def dropEvent(self, event):
-        if event.mimeData().hasFormat(_REGION_MIME):
-            source = event.mimeData().data(_REGION_MIME).data().decode()
-            if source != self._name:
-                self.reorder_requested.emit(source, self._name)
-            event.acceptProposedAction()
+    def set_drop_highlight(self, active: bool) -> None:
+        border = f"2px solid {_ACCENT}" if active else "1px solid #252525"
+        self.setStyleSheet(f"""
+            QFrame#regionWidget {{
+                background-color: {_BG_HEADER};
+                border: {border};
+                border-radius: 4px;
+                margin: 4px;
+            }}
+        """)
 
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
@@ -472,6 +462,93 @@ class _RegionWidget(QFrame):
 
 
 # ---------------------------------------------------------------------------
+# _CardGhost — floating semi-transparent drag image
+# ---------------------------------------------------------------------------
+
+class _CardGhost(QWidget):
+    """Frameless always-on-top window that follows the cursor during a card drag."""
+
+    def __init__(self, pixmap: QPixmap):
+        super().__init__(
+            None,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.X11BypassWindowManagerHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self._pixmap = pixmap
+        self.resize(pixmap.size())
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setOpacity(0.80)
+        p.drawPixmap(0, 0, self._pixmap)
+        p.end()
+
+    def move_center(self, gp: QPoint) -> None:
+        self.move(gp.x() - self.width() // 2, gp.y() - 16)
+
+
+# ---------------------------------------------------------------------------
+# _DragManager — global event filter for manual card drag
+# ---------------------------------------------------------------------------
+
+class _DragManager(QObject):
+    """Installed as a QApplication event filter for the duration of one card drag."""
+
+    def __init__(self, toast: "ViewerToast", source_name: str, ghost: _CardGhost):
+        super().__init__()
+        self._toast = toast
+        self._source_name = source_name
+        self._ghost = ghost
+        self._target: "_RegionWidget | None" = None
+
+    def eventFilter(self, obj, event) -> bool:
+        t = event.type()
+        if t == QEvent.Type.MouseMove:
+            gp = event.globalPosition().toPoint()
+            self._ghost.move_center(gp)
+            self._update_target(gp)
+        elif t == QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._finish()
+        return False   # never consume — other widgets still get events
+
+    def _update_target(self, gp: QPoint) -> None:
+        from PyQt6.QtWidgets import QApplication
+        widget_under = QApplication.widgetAt(gp)
+        new_target: "_RegionWidget | None" = None
+        w = widget_under
+        while w is not None:
+            if isinstance(w, _RegionWidget) and w._name != self._source_name:
+                new_target = w
+                break
+            w = w.parent()
+
+        if new_target is not self._target:
+            if self._target is not None:
+                self._target.set_drop_highlight(False)
+            self._target = new_target
+            if self._target is not None:
+                self._target.set_drop_highlight(True)
+
+    def _finish(self) -> None:
+        from PyQt6.QtWidgets import QApplication
+        QApplication.instance().removeEventFilter(self)
+        if self._target is not None:
+            self._target.set_drop_highlight(False)
+            self._toast._do_reorder(self._source_name, self._target._name)
+        self._ghost.hide()
+        self._ghost.deleteLater()
+        self._toast._card_dragging = False
+        self._toast._drag_manager = None
+        self._toast.drag_ended.emit()
+
+
+# ---------------------------------------------------------------------------
 # _HotkeyCapture
 # ---------------------------------------------------------------------------
 
@@ -485,7 +562,16 @@ class _HotkeyCapture(QThread):
     def run(self):
         from pynput import keyboard as _kb
         pressed: set[str] = set()
-        MOD_NAMES = {"ctrl", "alt", "shift", "cmd", "super"}
+
+        # Normalize platform-specific modifier variants to canonical pynput Key names
+        _MOD_NORM = {
+            "ctrl_l": "ctrl", "ctrl_r": "ctrl",
+            "alt_l": "alt",   "alt_r": "alt",
+            "shift":  "shift","shift_l": "shift", "shift_r": "shift",
+            "super_l": "cmd", "super_r": "cmd", "super": "cmd",
+            "cmd_l": "cmd", "cmd_r": "cmd",
+        }
+        MOD_NAMES = {"ctrl", "alt", "shift", "cmd"}
 
         def on_press(key):
             try:
@@ -493,14 +579,16 @@ class _HotkeyCapture(QThread):
             except Exception:
                 name = str(key)
             if name:
-                pressed.add(name)
+                pressed.add(_MOD_NORM.get(name, name))
 
         def on_release(key):
             mods = [k for k in pressed if k in MOD_NAMES]
             chars = [k for k in pressed if k not in MOD_NAMES]
             if chars:
-                parts = [f"<{m}>" for m in sorted(mods)] + chars
-                self.captured.emit("".join(parts))
+                # pynput GlobalHotKeys format: <ctrl>+<shift>+a  (+ separator, multi-char in <>)
+                parts = [f"<{m}>" for m in sorted(mods)]
+                parts += [f"<{c}>" if len(c) > 1 else c for c in chars]
+                self.captured.emit("+".join(parts))
                 self._stop.set()
 
         listener = _kb.Listener(on_press=on_press, on_release=on_release)
@@ -528,6 +616,8 @@ class ViewerToast(QWidget):
     region_reordered        = pyqtSignal(str, str)   # source_name, target_name
     region_click_requested  = pyqtSignal(str, float, float)  # name, rel_x, rel_y
     run_chain_requested     = pyqtSignal(str)         # chain_id
+    script_edit_requested   = pyqtSignal(str)         # chain_id
+    hotkey_saved            = pyqtSignal()            # any chain hotkey changed → reload listener
 
     # Internal signals for thread-safe calls from background threads
     _sig_update  = pyqtSignal(object)   # list[tuple[str, QPixmap]]
@@ -538,11 +628,13 @@ class ViewerToast(QWidget):
         super().__init__(parent)
 
         self._drag_pos: QPoint | None = None
-        self._pinned = True
+        self._pinned = False
         self._region_widgets: list[_RegionWidget] = []
         self._streamers: list = []
-        self._card_dragging = False  # True while a card QDrag is in exec()
-        self._layout_horizontal = False
+        self._card_dragging = False
+        self._drag_manager: _DragManager | None = None
+        self._pending_stream_payload = None
+        self._cols = 1
         self._scripts_target_key: str = ""
 
         self._setup_window()
@@ -557,6 +649,7 @@ class ViewerToast(QWidget):
         self._sig_update.connect(self._do_update_regions)
         self._sig_loading.connect(self._do_set_loading)
         self._sig_stream.connect(self._do_start_streaming)
+        self.drag_ended.connect(self._on_drag_ended)
 
         # Debounce timer for resize re-render
         self._resize_debounce = QTimer()
@@ -609,7 +702,8 @@ class ViewerToast(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        QTimer.singleShot(250, self.show_on_all_desktops)
+        if not self._pinned:  # pinned=False means "show on all desktops"
+            QTimer.singleShot(250, self.show_on_all_desktops)
 
     # ------------------------------------------------------------------
     # Resize grip placement
@@ -689,6 +783,7 @@ class ViewerToast(QWidget):
         # Tab toggles
         self._tab_regions_btn = QPushButton("Regions")
         self._tab_regions_btn.setFixedHeight(22)
+        self._tab_regions_btn.setMinimumWidth(0)
         self._tab_regions_btn.setCheckable(True)
         self._tab_regions_btn.setChecked(True)
         self._tab_regions_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -697,6 +792,7 @@ class ViewerToast(QWidget):
 
         self._tab_scripts_btn = QPushButton("Scripts")
         self._tab_scripts_btn.setFixedHeight(22)
+        self._tab_scripts_btn.setMinimumWidth(0)
         self._tab_scripts_btn.setCheckable(True)
         self._tab_scripts_btn.setChecked(False)
         self._tab_scripts_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -709,20 +805,24 @@ class ViewerToast(QWidget):
         # Map button
         self._map_btn = QPushButton("⬜ Map")
         self._map_btn.setFixedHeight(22)
+        self._map_btn.setMinimumWidth(0)
         self._map_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._map_btn.setStyleSheet(_BTN_INDIGO)
         self._map_btn.clicked.connect(self.map_requested.emit)
 
         # Refresh button
-        self._refresh_btn = QPushButton("⟳ Refresh")
-        self._refresh_btn.setFixedHeight(22)
+        self._refresh_btn = QPushButton("⟳")
+        self._refresh_btn.setFixedSize(22, 22)
+        self._refresh_btn.setMinimumWidth(0)
+        self._refresh_btn.setToolTip("Refresh")
         self._refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._refresh_btn.setStyleSheet(_BTN_GRAY)
         self._refresh_btn.clicked.connect(self.refresh_requested.emit)
 
         # Close button
         self._close_btn = QPushButton("✕")
-        self._close_btn.setFixedHeight(22)
+        self._close_btn.setFixedSize(22, 22)
+        self._close_btn.setMinimumWidth(0)
         self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._close_btn.setStyleSheet(_BTN_CLOSE)
         self._close_btn.clicked.connect(self.hide)
@@ -827,10 +927,11 @@ class ViewerToast(QWidget):
         self._content_widget.setStyleSheet(f"background: {_BG};")
         self._content_widget.setMinimumSize(0, 0)
         self._content_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self._content_layout = QVBoxLayout(self._content_widget)
+        self._content_layout = QGridLayout(self._content_widget)
         self._content_layout.setContentsMargins(4, 4, 4, 4)
         self._content_layout.setSpacing(4)
-        self._content_layout.addStretch()
+        self._content_layout.setColumnStretch(0, 1)
+        self._content_layout.setColumnStretch(1, 1)
 
         scroll.setWidget(self._content_widget)
         self._scroll_area = scroll
@@ -852,18 +953,21 @@ class ViewerToast(QWidget):
 
         self._pin_btn = QPushButton("📌 Pin")
         self._pin_btn.setFixedHeight(22)
+        self._pin_btn.setMinimumWidth(0)
         self._pin_btn.setCheckable(True)
-        self._pin_btn.setChecked(True)
+        self._pin_btn.setChecked(False)
+        self._pin_btn.setToolTip("Pin to current desktop (uncheck = visible on all desktops)")
         self._pin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._pin_btn.setStyleSheet(_BTN_INDIGO_CHECKED)
+        self._pin_btn.setStyleSheet(_BTN_PIN_UNPINNED)
         self._pin_btn.toggled.connect(self._on_pin_toggled)
 
         self._layout_btn = QPushButton("⇄")
         self._layout_btn.setFixedHeight(22)
+        self._layout_btn.setMinimumWidth(0)
         self._layout_btn.setCheckable(True)
         self._layout_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._layout_btn.setStyleSheet(_BTN_GRAY)
-        self._layout_btn.setToolTip("Toggle side-by-side layout")
+        self._layout_btn.setToolTip("Toggle 1-column / 2-column layout")
         self._layout_btn.toggled.connect(self._on_layout_toggled)
 
         layout.addWidget(self._count_label)
@@ -982,6 +1086,11 @@ class ViewerToast(QWidget):
         act_layout.setContentsMargins(0, 0, 0, 0)
         act_layout.setSpacing(4)
 
+        edit_btn = QPushButton("✏ Edit")
+        edit_btn.setFixedHeight(22)
+        edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        edit_btn.setStyleSheet(_BTN_GRAY)
+
         run_btn = QPushButton("▶ Run")
         run_btn.setFixedHeight(22)
         run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -993,6 +1102,7 @@ class ViewerToast(QWidget):
         del_btn.setStyleSheet(_BTN_GRAY)
 
         act_layout.addStretch()
+        act_layout.addWidget(edit_btn)
         act_layout.addWidget(run_btn)
         act_layout.addWidget(del_btn)
         outer.addWidget(action_row)
@@ -1008,8 +1118,11 @@ class ViewerToast(QWidget):
             for c in chains_list:
                 if c.id == chain_id:
                     c.hotkey = new_hk
-                    break
+                elif new_hk and c.hotkey == new_hk:
+                    # Exclusive: revoke this combo from any other chain
+                    c.hotkey = ""
             store.save_chains(self._scripts_target_key, chain_region, chains_list)
+            self.hotkey_saved.emit()
 
         hk_field.editingFinished.connect(_save_hotkey)
 
@@ -1018,11 +1131,18 @@ class ViewerToast(QWidget):
 
         def _start_rec():
             cap = _HotkeyCapture()
-            cap.captured.connect(lambda combo: (hk_field.setText(combo), cap.stop()))
+            def _on_captured(combo: str) -> None:
+                hk_field.setText(combo)
+                cap.stop()
+                _save_hotkey()
+            cap.captured.connect(_on_captured)
             cap.start()
             self._hotkey_capture = cap
 
         rec_btn.clicked.connect(_start_rec)
+
+        # Wire Edit button
+        edit_btn.clicked.connect(lambda: self.script_edit_requested.emit(chain_id))
 
         # Wire Run button
         run_btn.clicked.connect(lambda: self.run_chain_requested.emit(chain_id))
@@ -1039,33 +1159,20 @@ class ViewerToast(QWidget):
 
         return frame
 
+    def _place_grid(self) -> None:
+        """Place all _region_widgets into the QGridLayout at current _cols."""
+        for c in range(2):
+            self._content_layout.setColumnStretch(c, 1 if c < self._cols else 0)
+        for i, rw in enumerate(self._region_widgets):
+            row, col = divmod(i, self._cols)
+            self._content_layout.addWidget(rw, row, col)
+
     def _on_layout_toggled(self, horizontal: bool) -> None:
-        self._layout_horizontal = horizontal
-        while self._content_layout.count():
-            item = self._content_layout.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
-
-        QWidget().setLayout(self._content_layout)
-
-        if horizontal:
-            new_layout = QHBoxLayout(self._content_widget)
-            self._layout_btn.setStyleSheet(_BTN_INDIGO)
-        else:
-            new_layout = QVBoxLayout(self._content_widget)
-            self._layout_btn.setStyleSheet(_BTN_GRAY)
-
-        new_layout.setContentsMargins(4, 4, 4, 4)
-        new_layout.setSpacing(4)
-        new_layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
-        self._content_layout = new_layout
-
+        self._cols = 2 if horizontal else 1
         for rw in self._region_widgets:
-            rw.setParent(self._content_widget)
-            self._content_layout.addWidget(rw)
-
-        if not horizontal:
-            self._content_layout.addStretch()
+            self._content_layout.removeWidget(rw)
+        self._place_grid()
+        self._layout_btn.setStyleSheet(_BTN_INDIGO if horizontal else _BTN_GRAY)
 
     # ------------------------------------------------------------------
     # Stylesheet
@@ -1176,14 +1283,17 @@ class ViewerToast(QWidget):
     def _on_pin_toggled(self, checked: bool):
         self._pinned = checked
         was_visible = self.isVisible()
-        flags = self.windowFlags()
+        base = Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
         if checked:
-            flags |= Qt.WindowType.WindowStaysOnTopHint
+            # Pinned to current desktop — let WM manage it normally
+            self.setWindowFlags(base)
             self._pin_btn.setStyleSheet(_BTN_INDIGO_CHECKED)
         else:
-            flags &= ~Qt.WindowType.WindowStaysOnTopHint
+            # Pinned to screen (all desktops) — bypass WM
+            self.setWindowFlags(base | Qt.WindowType.X11BypassWindowManagerHint)
             self._pin_btn.setStyleSheet(_BTN_PIN_UNPINNED)
-        self.setWindowFlags(flags)
+            if was_visible:
+                QTimer.singleShot(250, self.show_on_all_desktops)
         if was_visible:
             self.show()
 
@@ -1207,27 +1317,24 @@ class ViewerToast(QWidget):
     def _do_update_regions(self, region_tiles: list[tuple[str, QPixmap]]) -> None:
         """Main-thread slot: rebuild all region widgets."""
         if self._card_dragging:
-            return  # never delete widgets while a QDrag.exec() is running
-        # Remove existing widgets (all but the trailing stretch)
+            return  # never delete widgets while a drag is running
         for rw in self._region_widgets:
             self._content_layout.removeWidget(rw)
+            rw.hide()
+            rw.setParent(None)
             rw.deleteLater()
         self._region_widgets.clear()
 
         for name, pixmap in region_tiles:
             rw = _RegionWidget(name, pixmap, self._content_widget)
-            if self._layout_horizontal:
-                self._content_layout.addWidget(rw)
-            else:
-                # Insert before the trailing stretch (last item)
-                insert_idx = self._content_layout.count() - 1
-                self._content_layout.insertWidget(insert_idx, rw)
             self._region_widgets.append(rw)
             rw.rename_requested.connect(self._on_rename_region)
             rw.delete_requested.connect(self._on_delete_region)
             rw.remap_requested.connect(self._on_remap_region)
             rw.reorder_requested.connect(self._on_reorder)
             rw.click_requested.connect(self.region_click_requested)
+
+        self._place_grid()
 
         count = len(region_tiles)
         self._count_label.setText(
@@ -1258,46 +1365,79 @@ class ViewerToast(QWidget):
             s.stop()
         self._streamers.clear()
 
-    def _do_start_streaming(self, payload: tuple) -> None:
-        """Main-thread slot: rebuild widgets and launch a RegionStreamer per region."""
-        from rearview.region_streamer import RegionStreamer
-
-        regions, target = payload
-        self._stop_streamers()
-
+    def _start_managed_drag(self, source: _RegionWidget, name: str, press_pos: QPoint) -> None:
         if self._card_dragging:
             return
+        px = source.grab()
+        max_w = self.width() - 24
+        if max_w > 0 and px.width() > max_w:
+            px = px.scaledToWidth(max_w, Qt.TransformationMode.SmoothTransformation)
+        ghost = _CardGhost(px)
+        ghost.move_center(press_pos)
+        ghost.show()
+        self._card_dragging = True
+        self._drag_manager = _DragManager(self, name, ghost)
+        from PyQt6.QtWidgets import QApplication
+        QApplication.instance().installEventFilter(self._drag_manager)
 
-        for rw in self._region_widgets:
-            self._content_layout.removeWidget(rw)
-            rw.deleteLater()
-        self._region_widgets.clear()
+    def _do_reorder(self, source: str, target: str) -> None:
+        self.region_reordered.emit(source, target)
 
-        for region in regions:
-            rw = _RegionWidget(region.name, parent=self._content_widget)
-            if self._layout_horizontal:
-                self._content_layout.addWidget(rw)
-            else:
-                self._content_layout.insertWidget(self._content_layout.count() - 1, rw)
-            self._region_widgets.append(rw)
-            rw.rename_requested.connect(self._on_rename_region)
-            rw.delete_requested.connect(self._on_delete_region)
-            rw.remap_requested.connect(self._on_remap_region)
-            rw.reorder_requested.connect(self._on_reorder)
-            rw.click_requested.connect(self.region_click_requested)
+    def _on_drag_ended(self) -> None:
+        if self._pending_stream_payload is not None:
+            payload = self._pending_stream_payload
+            self._pending_stream_payload = None
+            self._do_start_streaming(payload)
 
-            streamer = RegionStreamer(region, target=target, parent=self)
-            rw.connect_streamer(streamer)
-            streamer.start()
-            self._streamers.append(streamer)
+    def _do_start_streaming(self, payload: tuple) -> None:
+        """Main-thread slot: rebuild widgets and launch a RegionStreamer per region."""
+        try:
+            from rearview.region_streamer import RegionStreamer
 
-        if not self._header_visible:
+            regions, target = payload
+            self._stop_streamers()
+
+            if self._card_dragging:
+                self._pending_stream_payload = payload
+                return
+
             for rw in self._region_widgets:
-                rw.set_lean(True)
+                self._content_layout.removeWidget(rw)
+                rw.hide()
+                rw.setParent(None)
+                rw.deleteLater()
+            self._region_widgets.clear()
 
-        count = len(regions)
-        self._count_label.setText(f"{count} region{'s' if count != 1 else ''}")
-        self._status_label.setText("Streaming")
+            for region in regions:
+                rw = _RegionWidget(region.name, parent=self._content_widget)
+                self._region_widgets.append(rw)
+                rw.rename_requested.connect(self._on_rename_region)
+                rw.delete_requested.connect(self._on_delete_region)
+                rw.remap_requested.connect(self._on_remap_region)
+                rw.reorder_requested.connect(self._on_reorder)
+                rw.click_requested.connect(self.region_click_requested)
+
+                try:
+                    streamer = RegionStreamer(region, target=target, parent=self)
+                    rw.connect_streamer(streamer)
+                    streamer.start()
+                    self._streamers.append(streamer)
+                except Exception as _se:
+                    import logging as _log
+                    _log.getLogger(__name__).warning("Streamer failed for %s: %s", region.name, _se)
+
+            self._place_grid()
+
+            if not self._header_visible:
+                for rw in self._region_widgets:
+                    rw.set_lean(True)
+
+            count = len(regions)
+            self._count_label.setText(f"{count} region{'s' if count != 1 else ''}")
+            self._status_label.setText("Streaming")
+        except Exception as _e:
+            import logging as _log
+            _log.getLogger(__name__).error("_do_start_streaming failed: %s", _e, exc_info=True)
 
     def closeEvent(self, event) -> None:
         self._stop_streamers()

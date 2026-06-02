@@ -137,6 +137,7 @@ class _ScriptNameBar(QWidget):
 
 class RegionMapperOverlay(QWidget):
     regions_updated = pyqtSignal(list)
+    region_live_updated = pyqtSignal(list)  # fires immediately when a rect is added, without closing overlay
     cancelled = pyqtSignal()
     script_saved = pyqtSignal(str)   # emits target_key so toast can reload
 
@@ -154,12 +155,19 @@ class RegionMapperOverlay(QWidget):
         target_key: str,
         existing_regions: Optional[list[Region]] = None,
         existing_dots: Optional[list[ClickDot]] = None,
+        existing_connections: Optional[list[tuple[str, str, float]]] = None,
+        initial_tool: str = "rect",
+        initial_script_name: str = "",
         parent=None,
     ):
         super().__init__(parent)
         self._target_key = target_key
         self._regions: list[Region] = list(existing_regions) if existing_regions else []
         self._dots: list[ClickDot] = list(existing_dots) if existing_dots else []
+        # Track which dot IDs were loaded at session start so deletions can be correctly persisted
+        self._session_dot_ids: set[str] = {d.id for d in self._dots}
+        # True when editing an existing script (script name pre-filled) — affects auto-save scope
+        self._edit_mode: bool = bool(initial_script_name)
         self._tool: str = "rect"   # "rect" | "dot"
         self._drawing = False
         self._start: QPoint = QPoint()
@@ -178,11 +186,16 @@ class RegionMapperOverlay(QWidget):
         self.setGeometry(geom)
 
         # Connection editor state
-        self._connections: list[tuple[str, str, float]] = []  # (from_dot_id, to_dot_id, delay_s)
+        self._connections: list[tuple[str, str, float]] = list(existing_connections) if existing_connections else []
         self._connecting_from: Optional[ClickDot] = None       # dot being dragged from
         self._connect_to_pos: QPoint = QPoint()                # current drag end position
 
         self._build_ui()
+
+        if initial_tool == "dot":
+            self._set_tool("dot")
+        if initial_script_name:
+            self._script_name_bar._name_edit.setText(initial_script_name)
 
     # ------------------------------------------------------------------
     # UI setup
@@ -446,6 +459,7 @@ class RegionMapperOverlay(QWidget):
     def keyPressEvent(self, event) -> None:
         key = event.key()
         if key == Qt.Key.Key_Escape:
+            self._persist_deletions_only()
             self.cancelled.emit()
             self.close()
         elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -553,6 +567,26 @@ class RegionMapperOverlay(QWidget):
             self._connections.pop(idx)
             self.update()
 
+    def _persist_dot_deletions(self) -> None:
+        """Save current dot state (including new dots) — used when Done is pressed."""
+        store = get_click_store()
+        existing_dots = store.load_dots(self._target_key, "_overlay")
+        # Preserve dots from other sessions; replace this session's dots with current state
+        preserved = [d for d in existing_dots if d.id not in self._session_dot_ids]
+        store.save_dots(self._target_key, "_overlay", preserved + list(self._dots))
+
+    def _persist_deletions_only(self) -> None:
+        """On cancel: persist deletions but discard any newly added dots from this session."""
+        store = get_click_store()
+        existing_dots = store.load_dots(self._target_key, "_overlay")
+        current_ids = {d.id for d in self._dots}
+        # Dots not from this session → keep as-is
+        other_dots = [d for d in existing_dots if d.id not in self._session_dot_ids]
+        # Dots loaded at session start that the user did NOT delete → keep
+        kept = [d for d in existing_dots if d.id in self._session_dot_ids and d.id in current_ids]
+        # New dots (placed this session, not in session_dot_ids) → discard on cancel
+        store.save_dots(self._target_key, "_overlay", other_dots + kept)
+
     def _on_save_script(self, name: str) -> None:
         if not self._dots:
             self._script_name_bar.show_feedback("⚠ Place dots first")
@@ -589,9 +623,16 @@ class RegionMapperOverlay(QWidget):
         store = get_click_store()
         existing = store.load_chains(self._target_key, "_overlay")
         existing = [c for c in existing if c.name != name]
+
+        # Preserve only dots from completely unrelated sessions (not loaded into this overlay)
+        existing_dots = store.load_dots(self._target_key, "_overlay")
+        preserved = [d for d in existing_dots if d.id not in self._session_dot_ids]
+
         existing.append(chain)
         store.save_chains(self._target_key, "_overlay", existing)
-        store.save_dots(self._target_key, "_overlay", list(self._dots))
+        store.save_dots(self._target_key, "_overlay", preserved + list(self._dots))
+        # Keep session_dot_ids in sync so future saves in this session stay consistent
+        self._session_dot_ids = {d.id for d in self._dots}
 
         self._script_name_bar.show_feedback("✓ Saved!")
         self.script_saved.emit(self._target_key)
@@ -609,15 +650,18 @@ class RegionMapperOverlay(QWidget):
         return color
 
     def _prompt_name_and_add(self, rect: QRect) -> None:
+        default = f"Region {len(self._regions) + 1}"
         name, ok = QInputDialog.getText(
             self,
             "Name this region",
             "Region name:",
+            text=default,
         )
-        if ok and name.strip():
+        if ok:
+            name = name.strip() or default
             color = self._next_color()
             region = Region(
-                name=name.strip(),
+                name=name,
                 x=rect.x(),
                 y=rect.y(),
                 w=rect.width(),
@@ -625,6 +669,7 @@ class RegionMapperOverlay(QWidget):
                 color=color,
             )
             self._regions.append(region)
+            self.region_live_updated.emit(list(self._regions))
             self.update()
 
     def _show_context_menu(self, global_pos: QPoint, region: Region) -> None:
@@ -647,9 +692,22 @@ class RegionMapperOverlay(QWidget):
             self.update()
 
     def _on_done(self) -> None:
+        # Auto-save any dots newly placed this session that haven't been saved as a chain yet
+        new_dot_ids = {d.id for d in self._dots} - self._session_dot_ids
+        if new_dot_ids:
+            if self._edit_mode:
+                # Editing an existing script — update it with all current dots (original + new)
+                self._on_save_script(self._script_name_bar.name())
+            else:
+                # New script context — save only the newly placed dots so existing scripts aren't polluted
+                original_dots = self._dots
+                self._dots = [d for d in self._dots if d.id in new_dot_ids]
+                self._on_save_script(self._script_name_bar.name())
+                self._dots = original_dots
+                self._session_dot_ids = {d.id for d in original_dots}
+
         store = RegionStore()
         store.save(self._target_key, self._regions)
-        # Save dots keyed to target; use "_overlay" as region_name since dots are screen-absolute
-        get_click_store().save_dots(self._target_key, "_overlay", list(self._dots))
+        self._persist_dot_deletions()
         self.regions_updated.emit(list(self._regions))
         self.close()
